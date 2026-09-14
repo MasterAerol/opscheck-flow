@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "columns": {
+    "order_id": {"required": true, "unique": true},
+    "customer": {"required": true},
+    "email": {"required": true, "type": "email"},
+    "total": {"required": true, "type": "number", "min": 0},
+    "status": {"required": true, "allowed": ["paid", "pending", "refunded"]},
+    "order_date": {"required": true, "type": "date"}
+  }
+}

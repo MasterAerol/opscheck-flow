@@ -232,6 +232,17 @@ def _approval_html(result: dict) -> str:
     return content + '</section>'
 
 
+def _ingestion_html(result: dict) -> str:
+    event = result.get('ingestion')
+    if not event:
+        return ''
+    content = '<section><h2>Event ingestion</h2>'
+    for key, label in (('id', 'Event'), ('event_id', 'External event ID'), ('event_type', 'Type'),
+                       ('status', 'Event status'), ('manifest_path', 'Manifest'), ('fingerprint', 'Fingerprint')):
+        content += f'<p class="source">{label}: {_s(event.get(key) or "Unspecified")}</p>'
+    return content + '</section>'
+
+
 def render_workflow_html(result: dict) -> str:
     """Render execution evidence separately from underlying business findings."""
     status = str(result.get('status', 'unknown')).lower()
@@ -262,6 +273,7 @@ def render_workflow_html(result: dict) -> str:
         content += '<p class="muted">No briefing is available. Review task status and execution events below.</p>'
     content += _revision_html(results.get('briefing_agent', {}))
     content += _approval_html(result)
+    content += _ingestion_html(result)
     content += '</div></section><section><div class="section-heading"><h2>Check results</h2><span class="muted">Source-level evidence</span></div><div class="panel panel-pad">'
     if quality:
         content += f'<h3>Data quality {_badge(quality.get("status", "unknown"))}</h3><p class="muted">{_s(q.get("rows", 0))} records checked · {_s(q.get("issues", 0))} issues · {_s(q.get("affected_rows", 0))} affected records</p>'

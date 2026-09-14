@@ -41,6 +41,10 @@ class TransientTaskError(RuntimeError):
     retryable = True
 
 
+class RunBusyError(OpsCheckError):
+    """Another process currently owns the execution lock."""
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
@@ -100,7 +104,7 @@ def _run_lock(state_dir: Path, run_id: str, sources: list[Path]):
             try:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
-                raise OpsCheckError(f"Run {run_id} is already executing.") from exc
+                raise RunBusyError(f"Run {run_id} is already executing.") from exc
             try:
                 yield
             finally:
@@ -114,7 +118,7 @@ def _run_lock(state_dir: Path, run_id: str, sources: list[Path]):
             try:
                 msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
             except OSError as exc:
-                raise OpsCheckError(f"Run {run_id} is already executing.") from exc
+                raise RunBusyError(f"Run {run_id} is already executing.") from exc
             try:
                 yield
             finally:
@@ -158,6 +162,8 @@ def _connect(path: Path) -> sqlite3.Connection:
         """)
         from .approvals import initialize
         initialize(connection)
+        from .event_store import initialize as initialize_events
+        initialize_events(connection)
     except BaseException:
         # Ownership transfers only after initialization succeeds.
         connection.close()
@@ -174,14 +180,30 @@ def _event(connection: sqlite3.Connection, run_id: str, event: str,
 
 
 def _fingerprint(paths: list[Path], config: dict) -> str:
-    contents = []
+    hashes = []
     for path in paths:
         digest = hashlib.sha256()
         with path.open("rb") as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(block)
-        contents.append({"path": str(path), "sha256": digest.hexdigest()})
+        hashes.append(digest.hexdigest())
+    return fingerprint_from_hashes(paths, config, hashes)
+
+
+def fingerprint_from_hashes(paths: list[Path], config: dict, hashes: list[str]) -> str:
+    """Bind a workflow to the same bytes used when an ingestion event was received."""
+    if len(paths) != len(hashes):
+        raise OpsCheckError("Each input must have an expected content hash.")
+    contents = [{"path": str(path), "sha256": digest} for path, digest in zip(paths, hashes)]
     return hashlib.sha256(_json({"config": config, "inputs": contents}).encode("utf-8")).hexdigest()
+
+
+def workflow_config(paths: list[Path], key: str = "order_id", llm_url=None, model=None,
+                    max_rounds: int = 2, max_human_revisions: int = 3) -> dict:
+    """Canonical execution configuration shared with the ingestion reservation."""
+    return {"key": key, "llm_url": llm_url, "model": model, "max_rounds": max_rounds,
+            "input_paths": [str(path) for path in paths], "workflow_version": 2,
+            "max_human_revisions": max_human_revisions}
 
 
 def _retryable(error: Exception) -> bool:
@@ -353,7 +375,8 @@ def _result(connection: sqlite3.Connection, run_id: str, state_dir: Path) -> dic
     if approvals:
         outputs["briefing_agent"] = approvals[-1]["briefing"]
     pending = next((item for item in approvals if item["status"] == "pending"), None)
-    return {"run_id": run_id, "status": run["status"],
+    from .event_store import run_metadata
+    return {"run_id": run_id, "status": run["status"], "ingestion": run_metadata(connection, run_id),
             "failure_reason": run["failure_reason"], "approvals": approvals,
             "active_approval_id": pending["id"] if pending else None,
             "approval_iteration": approvals[-1]["iteration"] if approvals else 0,
@@ -368,7 +391,7 @@ def _result(connection: sqlite3.Connection, run_id: str, state_dir: Path) -> dic
 def run_workflow(input_path, rules_path, before_path, after_path, key="order_id",
                  state_dir=Path(".opscheck/runs"), run_id=None, max_attempts=2,
                  fail_once=None, llm_url=None, model=None, max_rounds=2,
-                 max_human_revisions=3) -> dict:
+                 max_human_revisions=3, *, reserved_run_id=None, expected_fingerprint=None) -> dict:
     """Execute or resume a workflow; execution failures are returned with evidence.
 
     max_attempts is the allowance per task for this invocation. Saved attempt totals
@@ -393,26 +416,35 @@ def run_workflow(input_path, rules_path, before_path, after_path, key="order_id"
         raise OpsCheckError("llm_url and model must be nonblank.")
     if run_id is not None and (not isinstance(run_id, str) or re.fullmatch(r"[0-9a-f]{32}", run_id) is None):
         raise OpsCheckError("run_id must be an existing 32-character lowercase hexadecimal ID.")
+    if reserved_run_id is not None and (run_id is not None or not isinstance(reserved_run_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", reserved_run_id) is None
+            or not isinstance(expected_fingerprint, str) or re.fullmatch(r"[0-9a-f]{64}", expected_fingerprint) is None):
+        raise OpsCheckError("A reserved run requires a valid ID and expected fingerprint, without run_id.")
     try:
         paths = [Path(path).expanduser().absolute() for path in (input_path, rules_path, before_path, after_path)]
         state_dir = Path(state_dir).expanduser().absolute()
     except (TypeError, ValueError) as exc:
         raise OpsCheckError("Input and state paths must be filesystem paths.") from exc
-    config = {"key": key, "llm_url": llm_url, "model": model, "max_rounds": max_rounds,
-              "input_paths": [str(path) for path in paths], "workflow_version": 2,
-              "max_human_revisions": max_human_revisions}
+    config = workflow_config(paths, key, llm_url, model, max_rounds, max_human_revisions)
     try:
         # Rules are configuration; reject malformed rules before creating run state.
         load_rules(paths[1])
         fingerprint = _fingerprint(paths, config)
+        if expected_fingerprint is not None and fingerprint != expected_fingerprint:
+            raise OpsCheckError("Input files changed after event receipt; restore the original bytes before retrying this event.")
         database = _state_path(state_dir, paths)
         resuming = run_id is not None
-        run_id = run_id or uuid.uuid4().hex
+        run_id = reserved_run_id or run_id or uuid.uuid4().hex
         with _run_lock(state_dir, run_id, paths):
             connection = _connect(database)
             try:
                 with connection:
                     existing = connection.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+                    if reserved_run_id is not None:
+                        reservation = connection.execute("SELECT expected_workflow_fingerprint FROM ingestion_events WHERE workflow_run_id=?", (run_id,)).fetchone()
+                        if reservation is None or reservation[0] != expected_fingerprint:
+                            raise OpsCheckError("No matching durable event reservation exists for this run.")
+                        resuming = existing is not None
                     if resuming:
                         if existing is None:
                             raise OpsCheckError(f"Run {run_id} does not exist in this state directory.")
@@ -460,6 +492,9 @@ def _publish_result(connection: sqlite3.Connection, run_id: str, state_dir: Path
                     paths: list[Path]) -> dict:
     """Rebuild disposable reports from committed SQLite state under the run lock."""
     from .artifacts import write_workflow_reports
+    from .event_store import synchronize
+    with connection:
+        synchronize(connection, run_id)
     result = _result(connection, run_id, state_dir)
     write_workflow_reports(result, paths)
     return result

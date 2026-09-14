@@ -1,0 +1,11 @@
+order_id,customer,email,total,status,order_date
+ORD-1001,Alba,buyer01@example.com,1299,paid,2026-09-01
+ORD-1002,Bruno,buyer02@example.com,850,pending,2026-09-02
+ORD-1002,Carla,buyer03@example.com,450,paid,2026-09-02
+ORD-1004,Dario,,640,paid,2026-09-03
+ORD-1005,Eva,buyer05example.com,320,pending,2026-09-03
+ORD-1006,Finn,buyer06@example.com,-120,pending,2026-09-03
+ORD-1007,Gia,buyer07@example.com,760,shipped,2026-09-04
+ORD-1008,Hiro,buyer08@example.com,550,paid,2026-02-30
+,Ines,buyer09@example.com,230,pending,2026-09-04
+ORD-1010,Juno,buyer10@example.com,"1,200",paid,2026-09-04
