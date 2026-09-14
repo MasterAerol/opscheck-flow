@@ -29,8 +29,8 @@ def _value(value: Any) -> str:
 
 
 def _badge(status: Any) -> str:
-    status = str(status)
-    style = 'warning' if status in ('changed', 'running', 'pending') else 'danger' if status in ('fail', 'failed', 'blocked') else '' if status in ('pass', 'succeeded', 'unchanged') else 'neutral'
+    status = str(status).lower()
+    style = 'warning' if status in ('changed', 'running', 'pending', 'waiting', 'waiting_for_approval') else 'danger' if status in ('fail', 'failed', 'blocked', 'rejected') else '' if status in ('pass', 'succeeded', 'unchanged', 'approved') else 'neutral'
     return f'<span class="badge {style}">{_s(status.replace("_", " ").capitalize())}</span>'
 
 
@@ -193,32 +193,75 @@ def _briefing_html(value: Any) -> str:
     return html
 
 
+def _revision_html(briefing: dict) -> str:
+    revision = briefing.get('revision')
+    if not revision:
+        return ''
+    content = f'<h3>Human revision {_s(revision["number"])}</h3><p class="briefing">Feedback: {_s(revision["feedback"])}</p>'
+    content += f'<p class="muted">{_s(revision["sampling_note"])}</p>'
+    for section in revision['sections']:
+        content += f'<h3>{_s(section["title"])} ({_s(section["total"])} total)</h3>'
+        rows = []
+        for finding in section['findings']:
+            if 'row' in finding:
+                rows.append('<tr>' + ''.join(f'<td>{_s(finding.get(key, ""))}</td>'
+                            for key in ('row', 'column', 'code', 'value', 'message')) + '</tr>')
+            else:
+                rows.append('<tr>' + ''.join(f'<td class="cell-value">{_s(json.dumps(finding.get(key), ensure_ascii=False))}</td>'
+                            for key in ('key', 'kind', 'fields', 'before', 'after')) + '</tr>')
+        headers = ['Row', 'Field', 'Issue', 'Value', 'Explanation'] if 'schema' not in section else ['Order ID', 'Change', 'Fields', 'Before', 'After']
+        content += _table(headers, rows) if rows else '<p>No record findings.</p>'
+        if 'schema' in section:
+            content += f'<p>Column changes: {_s(json.dumps(section["schema"], ensure_ascii=False))}</p>'
+    return content
+
+
+def _approval_html(result: dict) -> str:
+    approvals = result.get('approvals', [])
+    content = '<section><h2>Approval History</h2>'
+    if result.get('failure_reason'):
+        content += f'<p class="notice">{_s(result["failure_reason"])}</p>'
+    if not approvals:
+        return content + '<p>No human approval requested.</p></section>'
+    content += f'<p>Approval Status: {_s(approvals[-1]["status"].capitalize())}</p>'
+    for item in approvals:
+        content += f'<div class="action"><h3>Version {_s(item["iteration"])} · {_badge(item["status"])}</h3>'
+        content += f'<p>Reviewer: {_s(item.get("reviewer") or "Unspecified")}</p>'
+        content += f'<p class="briefing">Comment: {_s(item.get("comment") or "")}</p>'
+        content += f'<p class="muted">Created: {_s(item["created_at"])}<br>Decided: {_s(item.get("decided_at") or "Pending")}</p></div>'
+    return content + '</section>'
+
+
 def render_workflow_html(result: dict) -> str:
     """Render execution evidence separately from underlying business findings."""
-    status = result.get('status', 'unknown')
+    status = str(result.get('status', 'unknown')).lower()
     tasks = result.get('tasks', [])
     results = result.get('results', {})
     quality, changes = results.get('quality_agent', {}), results.get('change_agent', {})
     q, c = quality.get('summary', {}), changes.get('summary', {})
-    title = 'Your operations check, connected.' if status == 'succeeded' else 'The workflow needs attention.'
+    title = ('Your operations check, connected.' if status == 'succeeded' else
+             'Your briefing is ready for approval.' if status == 'waiting_for_approval' else
+             'The workflow needs attention.')
     mode = result.get('mode', 'local')
     mode_label = 'Local workflow · Deterministic checks and briefing' if mode == 'local' else 'Model-assisted briefing · Deterministic data checks'
     content = f'<div class="hero">{_badge(status)}<div class="eyebrow">Workflow report</div><h1>{title}</h1><p>Plan the work. Run specialist checks in parallel. Verify the evidence. Prepare a clear briefing.</p><p class="source">Run: {_s(result.get("run_id", ""))}</p></div>'
     content += '<p class="muted" style="margin-top:14px">' + _s(mode_label) + '</p>'
     content += _stats([('Steps completed', f'{sum(t.get("status") == "succeeded" for t in tasks)} / {len(tasks)}', ''), ('Execution attempts', sum(t.get('attempts', 0) for t in tasks), ''), ('Validation issues', q.get('issues', '—'), 'alert' if q.get('issues') else ''), ('Record changes', c.get('total_changes', '—'), 'alert' if c.get('total_changes') else '')])
-    content += '<p class="muted">Workflow success means the steps executed and verification passed. Validation issues and data changes are separate business results.</p>'
+    content += '<p class="muted">Workflow success means the steps executed, verification passed, and the human approved the briefing. Validation issues and data changes are separate business results.</p>'
     task_map = {t['id']: t for t in tasks}
     labels = {'planner': ('01', 'Plan the workflow', 'Define dependencies and the execution plan'), 'quality_agent': ('02', 'Quality specialist', 'Validate records against configured rules'), 'change_agent': ('03', 'Change specialist', 'Compare snapshots by a stable record key'), 'verifier': ('04', 'Verify the evidence', 'Rerun checks and confirm result consistency'), 'briefing_agent': ('05', 'Prepare the briefing', 'Turn verified findings into next actions')}
     def stage(task_id: str) -> str:
         number, label, detail = labels[task_id]
         task = task_map.get(task_id, {})
         return f'<div class="flow-stage"><span class="num">STEP {number}</span><b>{label}</b><small>{detail}</small><div style="margin-top:8px">{_badge(task.get("status", "pending"))}</div></div>'
-    content += '<div class="workflow-layout"><aside class="flow-map" aria-label="Workflow stages">' + stage('planner') + '<div class="arrow" aria-hidden="true">↓</div><div class="parallel"><span class="eyebrow">Parallel checks</span>' + stage('quality_agent') + stage('change_agent') + '</div><div class="arrow" aria-hidden="true">↓</div>' + stage('verifier') + '<div class="arrow" aria-hidden="true">↓</div>' + stage('briefing_agent') + '</aside><div class="workflow-main">'
+    content += '<div class="workflow-layout"><aside class="flow-map" aria-label="Workflow stages">' + stage('planner') + '<div class="arrow" aria-hidden="true">↓</div><div class="parallel"><span class="eyebrow">Parallel checks</span>' + stage('quality_agent') + stage('change_agent') + '</div><div class="arrow" aria-hidden="true">↓</div>' + stage('verifier') + '<div class="arrow" aria-hidden="true">↓</div>' + stage('briefing_agent') + '<div class="flow-stage"><b>Approval gate</b><small>Human decision: approve or request revision</small>' + _badge(result.get('approvals', [{}])[-1].get('status', 'pending') if result.get('approvals') else 'pending') + '<p class="muted">Rejected → Revision agent → Approval gate</p></div></aside><div class="workflow-main">'
     content += '<section><div class="section-heading"><h2>Operations briefing</h2>' + _badge(mode) + '</div><div class="panel panel-pad">'
     if 'briefing_agent' in results:
         content += _briefing_html(results['briefing_agent'])
     else:
         content += '<p class="muted">No briefing is available. Review task status and execution events below.</p>'
+    content += _revision_html(results.get('briefing_agent', {}))
+    content += _approval_html(result)
     content += '</div></section><section><div class="section-heading"><h2>Check results</h2><span class="muted">Source-level evidence</span></div><div class="panel panel-pad">'
     if quality:
         content += f'<h3>Data quality {_badge(quality.get("status", "unknown"))}</h3><p class="muted">{_s(q.get("rows", 0))} records checked · {_s(q.get("issues", 0))} issues · {_s(q.get("affected_rows", 0))} affected records</p>'

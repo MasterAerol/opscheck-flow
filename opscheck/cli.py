@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 import sys
-import tempfile
 from importlib import resources
 
+from .artifacts import _atomic_write, _protect_inputs
 from . import __version__
 from .core import OpsCheckError, compare, load_csv, load_rules, validate
-from .report import render_html, render_text, render_workflow_html
+from .report import render_html, render_text
 
 
 def _limit(value: str) -> int:
@@ -23,6 +22,12 @@ def _limit(value: str) -> int:
     if not 1 <= number <= 5000:
         raise argparse.ArgumentTypeError("must be between 1 and 5000")
     return number
+
+
+def _comment(value: str) -> str:
+    if not value.strip():
+        raise argparse.ArgumentTypeError("rejection requires a nonblank comment")
+    return value
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -62,46 +67,30 @@ def _parser() -> argparse.ArgumentParser:
     flow_demo = commands.add_parser("flow-demo", help="demonstrate parallel workers, retry, and saved state")
     flow_demo.add_argument("--resume", metavar="RUN_ID")
     runs = commands.add_parser("runs", help="list saved workflow runs")
-    for command in (flow, flow_demo, runs):
+    approval_commands = []
+    for name in ("approve", "reject", "approvals", "run", "resume"):
+        command = commands.add_parser(name, help={
+            "approve": "approve the pending briefing and finish",
+            "reject": "reject the pending briefing and revise",
+            "approvals": "show persisted approval history",
+            "run": "inspect a saved run", "resume": "resume using saved configuration",
+        }[name])
+        command.add_argument("run_id")
+        if name in ("approve", "reject"):
+            command.add_argument("--reviewer")
+            command.add_argument("--comment", required=name == "reject", type=_comment if name == "reject" else str)
+            command.add_argument("--approval-id", help="decide only this exact approval version")
+        if name == "resume":
+            command.add_argument("--max-attempts", type=int, default=2)
+        approval_commands.append(command)
+    for command in (flow, flow_demo, runs, *approval_commands):
         command.add_argument("--state-dir", type=Path, default=Path(".opscheck/runs"))
     for command in (flow, flow_demo):
+        command.add_argument("--max-human-revisions", type=int, default=3,
+                             help="fail after this many rejected versions (1-20; default: 3)")
         command.add_argument("--fail-once", choices=["quality_agent", "change_agent"],
                              help="demo only: inject a transient failure on the first attempt")
     return parser
-
-
-def _same_file(left: Path, right: Path) -> bool:
-    """Resolve relative paths and symlinks; samefile also catches hardlinks."""
-    if left.resolve() == right.resolve():
-        return True
-    return left.exists() and right.exists() and left.samefile(right)
-
-
-def _protect_inputs(outputs: list[Path], inputs: list[Path]) -> None:
-    for index, output in enumerate(outputs):
-        if output.exists() and not output.is_file():
-            raise OpsCheckError(f"Report destination is not a file: {output}")
-        for source in inputs:
-            if _same_file(output, source):
-                raise OpsCheckError(f"Report destination would overwrite an input: {output}")
-        for other in outputs[:index]:
-            if _same_file(output, other):
-                raise OpsCheckError("Each report must have a different destination.")
-
-
-def _atomic_write(path: Path, content: str) -> None:
-    """Avoid leaving a half-written individual report if writing fails."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
-                                         dir=path.parent, prefix=".opscheck-", delete=False) as stream:
-            temp_path = Path(stream.name)
-            stream.write(content)
-        os.replace(temp_path, path)
-    finally:
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
 
 
 def _save(result: dict, json_path: Path | None, html_path: Path | None) -> None:
@@ -158,32 +147,70 @@ def _run_flow(args: argparse.Namespace) -> int:
                                                    args.model, args.max_rounds)
             extra_json = args.json.expanduser().absolute() if args.json is not None else None
         if extra_json is not None:
-            _protect_inputs([extra_json], paths + [args.state_dir / "runs.sqlite3"])
+            database = args.state_dir / "runs.sqlite3"
+            protected = paths + [Path(str(database) + suffix) for suffix in ("", "-journal", "-wal", "-shm")]
+            protected += list(args.state_dir.glob("*.lock"))
+            _protect_inputs([extra_json], protected)
         result = run_workflow(*paths, key=key, state_dir=args.state_dir, run_id=args.resume,
                               max_attempts=attempts, fail_once=args.fail_once, llm_url=llm_url,
-                              model=model, max_rounds=rounds)
+                              model=model, max_rounds=rounds, max_human_revisions=args.max_human_revisions)
         destination = Path(result["state_dir"]) / result["run_id"]
         outputs = [destination / name for name in ("report.json", "report.html", "quality.html", "changes.html")]
+        outputs += [destination / f"briefing-v{item['iteration']}.json" for item in result["approvals"]]
         if extra_json is not None:
             outputs.append(extra_json)
         _protect_inputs(outputs, paths + [args.state_dir / "runs.sqlite3"])
         print(f"\nRun {result['run_id']}: {result['status'].upper()} ({result['mode']} mode)")
-        print("Plan: planner -> [quality_agent + change_agent] -> verifier -> briefing_agent")
+        print("Plan: planner -> [quality_agent + change_agent] -> verifier -> briefing_agent -> approval_gate")
         for task in result["tasks"]:
             print(f"  {task['id']}: {task['status']} ({task['attempts']} attempt(s))")
             if task.get("error"):
                 print(f"    {str(task['error'])!r}")
         data = json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
-        _atomic_write(outputs[0], data)
-        _atomic_write(outputs[1], render_workflow_html(result))
-        for task_id, output in (("quality_agent", outputs[2]), ("change_agent", outputs[3])):
-            if task_id in result["results"]:
-                _atomic_write(output, render_html(result["results"][task_id]))
         if extra_json is not None:
             _atomic_write(extra_json, data)
-        print(f"Report: {str(outputs[1])!r}")
-        print("Workflow completion means execution succeeded; inspect the report for data issues.")
-        return 0 if result["status"] == "succeeded" else 2
+        _print_run(result)
+        return 2 if result["status"] == "FAILED" else 0
+
+
+def _print_run(result: dict) -> None:
+    print(f"Run: {result['run_id']}\nStatus: {result['status']}")
+    print(f"Approval iteration: {result['approval_iteration']}")
+    print(f"Rejected revisions: {result['rejected_revisions']}")
+    print(f"Pending approval: {result['active_approval_id'] or 'None'}")
+    print(f"Report: {result['report_path']!r}")
+    if result.get("failure_reason"):
+        print(f"Failure reason: {result['failure_reason']!r}")
+    if result["status"] == "WAITING_FOR_APPROVAL":
+        print("Workflow paused. Run is waiting for human approval.")
+        directory = result['state_dir'].replace("'", "''")
+        suffix = f"--state-dir '{directory}' --approval-id {result['active_approval_id']}"
+        print(f"Approve: py -3.12 -m opscheck approve {result['run_id']} --reviewer 'Aerol' {suffix}")
+        print(f"Reject: py -3.12 -m opscheck reject {result['run_id']} --reviewer 'Aerol' --comment 'Explain affected records.' {suffix}")
+
+
+def _human_command(args: argparse.Namespace) -> int:
+    from .approvals import decide, inspect_run, resume_run
+    if args.command in ("approve", "reject"):
+        decision = "approved" if args.command == "approve" else "rejected"
+        result = decide(args.run_id, decision, args.reviewer, args.comment, args.state_dir, args.approval_id)
+        print(f"Approval: {decision.upper()}\nWorkflow resumed.")
+        if args.command == "reject" and result["status"] == "WAITING_FOR_APPROVAL":
+            print("revision_agent completed using verified evidence and human feedback.")
+    elif args.command == "resume":
+        result = resume_run(args.run_id, args.state_dir, args.max_attempts)
+    else:
+        result = inspect_run(args.run_id, args.state_dir)
+    if args.command == "approvals":
+        print(f"Approval history for run {args.run_id}")
+        for item in result["approvals"]:
+            print(f"\n#{item['iteration']} {item['status'].upper()}\nApproval ID: {item['id']}")
+            print(f"Reviewer: {item['reviewer']!r}\nComment: {item['comment']!r}")
+            print(f"Created: {item['created_at']}\nDecided: {item['decided_at'] or 'Pending'}")
+            print(f"Briefing: {item['briefing_reference']!r}")
+        return 0
+    _print_run(result)
+    return 2 if args.command in ("reject", "resume") and result["status"] == "FAILED" else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -193,6 +220,8 @@ def main(argv: list[str] | None = None) -> int:
             return _demo(args.out_dir)
         if args.command in ("flow", "flow-demo"):
             return _run_flow(args)
+        if args.command in ("approve", "reject", "approvals", "run", "resume"):
+            return _human_command(args)
         if args.command == "runs":
             from .workflow import list_runs
             for run in list_runs(args.state_dir):

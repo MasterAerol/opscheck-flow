@@ -20,7 +20,7 @@ class CliTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
 
     def command(self, *args):
-        return subprocess.run([sys.executable, "-m", "opscheck", *map(str, args)], cwd=ROOT,
+        return subprocess.run([sys.executable, "-m", "opscheck", *map(str, args)], cwd=ROOT, env={**os.environ, "PYTHONIOENCODING": "utf-8"},
                               capture_output=True, text=True, encoding="utf-8", timeout=30)
 
     def check(self, filename, *extra):

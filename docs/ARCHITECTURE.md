@@ -8,6 +8,9 @@ OpsCheck Flow separates a useful deterministic data tool from the orchestration 
 | --- | --- |
 | `opscheck/core.py` | CSV parsing, rule validation, data validation, and keyed comparison |
 | `opscheck/workflow.py` | Plan, concurrent task scheduling, verification, retries, SQLite state, resume, and run locks |
+| `opscheck/approvals.py` | Approval schema, atomic decisions, durable checkpoints, revision recovery, and inspection |
+| `opscheck/revision.py` | Deterministic clarification using verified evidence and human feedback |
+| `opscheck/artifacts.py` | Input protection and atomic report replacement under the run lock |
 | `opscheck/agents.py` | Bounded evidence, local chat-completions transport, analyst/reviewer role contexts, JSON validation, and revision loops |
 | `opscheck/report.py` | Human-readable summaries and escaped standalone HTML |
 | `opscheck/cli.py` | CLI arguments, exit codes, demo resources, destination protection, and report writes |
@@ -27,6 +30,11 @@ flowchart TD
     Q --> V[Verifier]
     C --> V
     V --> B[Briefing]
+    B --> G[Approval gate]
+    G -->|Approve| S[SUCCEEDED]
+    G -->|Reject within budget| R[Revision agent]
+    R --> G
+    G -->|Limit reached| F[FAILED]
 ```
 
 `quality_agent` and `change_agent` are independent Python workers scheduled through `ThreadPoolExecutor`. Their names describe responsibilities; they are not model calls. Each produces a structured result. The verifier waits for both and confirms result shape, count consistency, source identity, and equality with a fresh deterministic computation.
@@ -49,17 +57,18 @@ The default database is `.opscheck/runs/runs.sqlite3`.
 
 | Table | Stored information |
 | --- | --- |
-| `runs` | Run ID, configuration, fingerprint, run status, and timestamps |
+| `runs` | Run ID, configuration, fingerprint, explicit run status, failure reason, and timestamps |
 | `tasks` | Task states, accumulated attempts, errors, and completed outputs |
 | `events` | Ordered event history, task IDs, timestamps, and event details |
+| `approvals` | Version, decision, reviewer/comment, timestamps, briefing reference, immutable briefing JSON |
 
 Run IDs are generated UUID hex strings. Completing each task persists its output and state. Resume skips successful tasks and resets interrupted `running` tasks so they can be attempted again. Failed downstream work can continue after its dependency recovers.
 
-The resume fingerprint includes absolute input paths, file contents, the comparison key, model endpoint/name, and maximum model rounds. Changed source/configuration identity is rejected; start a new run for new exports. Recovery controls such as `max_attempts` and `fail_once` are excluded so they can change on resume without redefining the data being analyzed.
+The resume fingerprint includes absolute input paths, file contents, the comparison key, model endpoint/name, maximum model rounds, workflow version, and human rejection budget. Changed source/configuration identity is rejected; start a new run for new exports. Recovery controls such as `max_attempts` and `fail_once` are excluded so they can change on resume without redefining the data being analyzed.
 
 An OS advisory lock prevents concurrent execution of the same run. Locks automatically release when a process exits or crashes. The small `.lock` file remains as an inert marker; its presence does not mean the run is still executing. **Do not delete lock files to recover a run.** Deleting a marker while another process holds its lock can undermine mutual exclusion. Run locking supports POSIX and Windows systems.
 
-SQLite is local state, not distributed coordination. v0.1 does not provide a queue, cross-machine worker leasing, state migrations across future incompatible versions, or an encrypted data store.
+SQLite is local state, not distributed coordination. v0.1 does not provide a queue, cross-machine worker leasing, or an encrypted data store.
 
 ## Optional model subagents
 
@@ -105,7 +114,44 @@ Tool status and workflow status answer different questions:
 
 - `validate` fails its data check when findings exist and exits `1`.
 - `compare` reports changed records or schema and exits `1`.
-- A workflow can succeed with those results because every step executed and verified correctly; it exits `0`.
+- A workflow can succeed with those results because every step executed, verified correctly, and received human approval; it exits `0`. A durable approval pause also exits `0`.
 - Invalid input, execution failure, or I/O error yields CLI exit `2`.
 
-A workflow status of `succeeded` is never permission to apply a business action. v0.1 produces reviewable evidence and briefings; it does not change source records or contact external business services.
+A workflow status of `SUCCEEDED` is never permission to apply a business action. v0.1 produces reviewable evidence and briefings; it does not change source records or contact external business services.
+
+## Durable human decision boundary
+
+`PLAN` retains the existing executable DAG of planner, parallel specialists, verifier, and briefing. The conditional approval/revision state machine follows that DAG rather than pretending a human decision is a worker future. `approval_gate` is recorded as a task with `waiting`, `succeeded`, or `failed` status. Each attempted revision has its own `revision_agent_N` task record. The public plan includes both conditional roles.
+
+Run state uses `PENDING`, `RUNNING`, `WAITING_FOR_APPROVAL`, `SUCCEEDED`, and `FAILED`; task state remains lowercase. New runs are created pending and transition to running before execution. Completed workers no longer finalize a run. After the briefing output commits, the approval state machine atomically inserts the pending approval and its exact briefing JSON, records `approval_requested` and `workflow_paused`, and sets the run waiting. No terminal input loop or background process remains.
+
+An approval decision transaction updates only the observed pending ID using a conditional update. The same transaction stores the decision, identity, comment, timestamp, `approval_approved`/`approval_rejected`, `workflow_resumed`, and the run's `RUNNING` state. Approval then marks the gate and run successful. Rejection starts a focused deterministic revision against saved worker/verifier evidence and the rejected briefing. Its output commits before the next approval request is inserted.
+
+Crash boundaries are deliberate:
+
+| Last committed state | Recovery |
+| --- | --- |
+| Briefing completed, no request | Create the first pending request |
+| Pending request | Leave waiting; ordinary resume cannot approve |
+| Approved decision, run running | Finalize success without rerunning specialists |
+| Rejected decision, revision not completed | Execute or retry that revision |
+| Revision output saved, next request absent | Reuse the saved output and request the next approval |
+| Decision committed, report write failed | Regenerate reports from SQLite using `resume` |
+
+The default `max_human_revisions=3` means a maximum of three rejected versions, including the original. The third rejection fails the gate/run, persists a clear failure reason and `revision_limit_reached`, and creates no further request. This failure is terminal across resume. A revision execution error is saved separately and can be retried with resume. Normal worker retries remain bounded per invocation and independent of the human rejection budget and optional model review budget.
+
+`revision_started` and `revision_completed` events include task, iteration, and approval ID. Each successful revision retains the original summary, records feedback, orders validation or change detail first, and includes exact saved finding samples with aggregate totals and sampling disclosures. It does not revalidate changed source files, invent missing records, perform source repairs, or call an external service. A model-generated original briefing retains its original model review history; the new revision metadata explicitly identifies deterministic local revision.
+
+## Approval transactions and concurrency
+
+SQLite `BEGIN IMMEDIATE` serializes schema migration and decision writes. A partial unique index allows only one pending approval per run; `(run_id, iteration)` is unique. Triggers prevent changing resolved decisions, changing briefing identity/content, or deleting approval history through ordinary SQL. A local database owner can still alter the schema; this is not a tamper-proof compliance store.
+
+The existing OS run lock spans decision execution, revision computation, and report regeneration. It prevents two processes from writing competing reports or executing the same revision. Before taking this lock, a decision snapshots the current pending ID; the transaction must still match that exact ID and pending status. `--approval-id` additionally lets a delayed client bind a decision to the version actually reviewed. Without an explicit ID a newly started command intentionally observes the currently pending version. A losing concurrent command fails cleanly; it never redirects an observed old decision onto a new version.
+
+All SQLite connections close in `finally` blocks; a connection's transaction context alone is insufficient. Reports are rendered from committed state and replaced atomically per file while holding the run lock. They are not a transaction across all files. `inspect_run` reads a SQLite snapshot and does not trust reports. Individual approval snapshots remain in SQLite even if all report files are deleted.
+
+## Existing database compatibility
+
+Opening a Milestone 1 database adds the approval table/indexes/triggers and nullable failure reason, and normalizes run statuses to uppercase without changing task evidence. Legacy fingerprint verification continues to use the saved version-1 configuration. Already completed historical runs remain completed and do not gain fabricated approvals. An unfinished legacy run gains the approval gate after completing its briefing, with the default three-rejection budget. No general migration framework for future incompatible schemas is claimed.
+
+Human reviewer names are asserted local metadata, not authenticated accounts. SQLite and locks coordinate one local filesystem; network filesystem and distributed operation are not supported. HTML escapes human comments, reviewer names, source evidence, and failure reasons. The optional model reviewer remains a separate boundary and can never grant human approval.
