@@ -1,5 +1,9 @@
 # Learn by owning the project
 
+[README](../README.md) · [Current demo](DEMO_GUIDE.md) · [Interview guide](INTERVIEW_GUIDE.md) · [Project journey](PROJECT_JOURNEY.md)
+
+This study path originated with Milestone 1. The historical exercises below are retained with their current implementation status; use the demo guide for the complete queued approval lifecycle.
+
 This guide turns an AI-assisted starter project into practical experience. The aim is to be able to explain a decision, reproduce a failure, improve the implementation, and show evidence that your change works.
 
 Running generated code once is only the starting point. Work through the steps with your editor open and keep a short engineering log of what you changed, what surprised you, and how you verified it.
@@ -41,7 +45,7 @@ python -m opscheck flow-demo --resume RUN_ID
 
 Replace `RUN_ID` with your actual run ID. Find the `task_reused` events and compare attempt counts. The reused tasks should not execute again. Read the workflow tests that use a barrier and explain why a barrier provides stronger evidence of overlap than a very short elapsed time.
 
-For crash/failure recovery, use the explicit `flow` command in the README with `--fail-once quality_agent --max-attempts 1`; then resume that run. Change a copied input file before resuming another run and confirm that the fingerprint rejects it. Use a copy rather than modifying the bundled fixtures.
+For crash/failure recovery, use the explicit `flow` command in the [CLI guide](CLI_GUIDE.md#run-it-on-your-files) with `--fail-once quality_agent --max-attempts 1`; then resume that run. Change a copied input file before resuming another run and confirm that the fingerprint rejects it. Use a copy rather than modifying the bundled fixtures.
 
 **You should be able to explain:** dependency graphs, task state transitions, temporary versus permanent failures, bounded retries, persistence, identity checks, and why OS lock files are not deleted for recovery.
 
@@ -69,6 +73,8 @@ Skills: schema design, compatibility, input validation, and testing behavior rat
 
 ### Exercise B: Add a human approval gate
 
+**Implemented in Milestone 2.** Treat this original exercise as a design-review prompt: trace `approvals.py`, reproduce the revision demo, and inspect the existing concurrency tests before proposing another change.
+
 Introduce a review step before a generated briefing is marked ready to act on. A human should approve or reject a specific run's verified evidence through a CLI command. This exercise should record a decision locally; it should not send email, edit business files, or perform a real external action.
 
 Acceptance checks: the workflow pauses with a clear pending-approval state, the decision is recorded, resume continues only after approval, rejection is visible, changing inputs requires a new approval, and concurrent commands cannot approve different evidence under the same run ID. Design how old run state remains readable.
@@ -76,6 +82,8 @@ Acceptance checks: the workflow pauses with a clear pending-approval state, the 
 Skills: state-machine design, audit history, authorization boundaries, concurrency, and migration planning.
 
 ### Exercise C: Add scheduled folder processing with idempotency
+
+**Partly implemented:** Milestone 3 provides strict-manifest ingestion and one-shot scanning; Milestone 4 adds enqueue and worker polling. Review those interfaces first. Time-based scheduling and arbitrary CSV discovery remain proposals, not current capabilities.
 
 Build a separate command that scans a user-selected folder once, recognizes new CSV snapshots, and schedules a workflow per new content fingerprint. Run it manually first; integrate with an operating-system scheduler only after its one-shot behavior is reliable.
 

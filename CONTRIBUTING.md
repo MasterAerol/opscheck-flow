@@ -13,10 +13,19 @@ python -m unittest discover -s tests -v
 
 No third-party runtime package is required. Installing with `python -m pip install .` is optional for source development. Test new behavior from the checkout so an older installed copy cannot mask it.
 
+For an isolated Windows development environment:
+
+```powershell
+py -3.12 -m venv .venv
+& ./.venv/Scripts/python.exe -m unittest discover -s tests -v
+```
+
+On Linux, create the environment with `python3 -m venv .venv` and use `.venv/bin/python`. Packaging tools can be installed into this development environment with `python -m pip install build`; build an sdist and wheel with `python -m build`. Install the wheel into a second clean environment and run [scripts/smoke_installed.py](scripts/smoke_installed.py) from outside the checkout. The script verifies imports and exercises the approval, ingestion and queue lifecycles. See [validation](docs/VALIDATION.md) for the executed checks.
+
 ## Make a change
 
 1. Describe the problem and expected behavior in an issue or your pull request. For a large feature, discuss scope before implementation.
-2. Create a short-lived branch and keep the change focused.
+2. Create a short-lived feature/fix/documentation branch from current main; do not work directly on main. Keep the pull request focused.
 3. Add a synthetic fixture or regression test when behavior changes. Do not add actual customer exports, addresses, credentials, or private run histories.
 4. Update the relevant README or architecture section if public behavior changes.
 5. Run the test suite and the relevant CLI command. Report what you actually ran; do not describe an unrun check as passing.
@@ -31,6 +40,7 @@ No third-party runtime package is required. Installing with `python -m pip insta
 - Bound every retry and model revision loop. Distinguish transient failures from invalid configuration.
 - Preserve source files and avoid writing reports over inputs, including path aliases.
 - Test concurrency with synchronization primitives such as barriers; do not rely on short sleep timing or machine-speed assumptions.
+- Preserve Windows/Linux behavior, including path aliases, process locking and explicit SQLite connection closure. Use controlled clocks and barriers for deterministic timing tests. The CI matrix covers Ubuntu Python 3.10/3.12/3.14 and Windows Python 3.12; mark platform skips with an explicit reason.
 - Keep examples small enough to inspect manually. A future feature is a proposal until implemented and verified.
 
 If your change alters the JSON output shape, rule semantics, resume fingerprint, or state database, explain its compatibility impact. A migration or version increment may be needed.
