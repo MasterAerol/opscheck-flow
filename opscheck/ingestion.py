@@ -93,6 +93,16 @@ def _persist(connection: sqlite3.Connection, manifest: Manifest) -> tuple[str, b
         return event_id, duplicate
 
 
+def reserve(connection: sqlite3.Connection, event_id: str) -> str:
+    """Reserve once inside the caller's write transaction (enqueue or ingest claim)."""
+    run_id = connection.execute("SELECT workflow_run_id FROM ingestion_events WHERE id=?", (event_id,)).fetchone()[0]
+    if run_id is None:
+        run_id = uuid.uuid4().hex
+        connection.execute("UPDATE ingestion_events SET workflow_run_id=? WHERE id=?", (run_id, event_id))
+        store.log(connection, event_id, "workflow_reserved", run_id=run_id)
+    return run_id
+
+
 def _claim(connection: sqlite3.Connection, event: dict, retry: bool) -> str:
     """Reserve the run ID in the same CAS transaction as the durable claim.
 
@@ -101,21 +111,18 @@ def _claim(connection: sqlite3.Connection, event: dict, retry: bool) -> str:
     """
     connection.execute("BEGIN IMMEDIATE")
     with connection:
-        run_id = event["workflow_run_id"] or uuid.uuid4().hex
         timestamp = _now()
-        changed = connection.execute("""UPDATE ingestion_events SET status='CLAIMED',workflow_run_id=?,
+        changed = connection.execute("""UPDATE ingestion_events SET status='CLAIMED',
             claimed_at=?,updated_at=?,claim_attempts=claim_attempts+1,error=NULL,retryable=0
             WHERE id=? AND status=? AND claim_attempts=?""",
-            (run_id, timestamp, timestamp, event["id"], event["status"], event["claim_attempts"]))
+            (timestamp, timestamp, event["id"], event["status"], event["claim_attempts"]))
         if changed.rowcount != 1:
             raise RunBusyError("Event state changed while claiming; inspect its saved state.")
         if retry:
-            store.log(connection, event["id"], "event_retried", run_id=run_id)
+            store.log(connection, event["id"], "event_retried", run_id=event["workflow_run_id"])
         store.log(connection, event["id"], "event_claimed", attempt=event["claim_attempts"] + 1,
                   recovered=event["workflow_run_id"] is not None)
-        if event["workflow_run_id"] is None:
-            store.log(connection, event["id"], "workflow_reserved", run_id=run_id)
-        return run_id
+        return reserve(connection, event["id"])
 
 
 def _execute(event: dict, run_id: str, directory: Path) -> dict:
@@ -137,7 +144,7 @@ def _execute(event: dict, run_id: str, directory: Path) -> dict:
                         max_human_revisions=config["max_human_revisions"])
 
 
-def _process(event_id: str, directory: Path, retry: bool = False) -> tuple[dict, bool]:
+def _process(event_id: str, directory: Path, retry: bool = False, *, delivery: bool = False) -> tuple[dict, bool]:
     with _database(directory, create=False) as (connection, directory):
         event = store.get(connection, event_id)
         if event is None:
@@ -154,7 +161,7 @@ def _process(event_id: str, directory: Path, retry: bool = False) -> tuple[dict,
                 event = store.get(connection, event_id)
                 if event["status"] in ("INVALID", "WAITING_FOR_APPROVAL", "COMPLETED") or (
                         event["status"] == "FAILED" and (not retry or not event["retryable"])):
-                    if retry:
+                    if retry and not delivery:
                         raise OpsCheckError(f"Event in {event['status']} is not retryable.")
                     return event, False
                 run_id = _claim(connection, event, retry)
@@ -162,6 +169,8 @@ def _process(event_id: str, directory: Path, retry: bool = False) -> tuple[dict,
                 try:
                     _execute(event, run_id, directory)
                 except RunBusyError:
+                    if delivery:
+                        raise
                     # A direct workflow resume may already own the run lock.
                     pass
                 except (OpsCheckError, OSError, ValueError) as exc:
@@ -175,6 +184,8 @@ def _process(event_id: str, directory: Path, retry: bool = False) -> tuple[dict,
                     store.synchronize(connection, run_id)
                 created = not existed and connection.execute("SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone() is not None
         except RunBusyError:
+            if delivery:
+                raise
             # A duplicate returns the durable reservation/state; it never spins or
             # schedules a second run while the canonical processor is still active.
             pass
@@ -196,8 +207,8 @@ def _invalid_raw_hash(path: Path) -> str:
     return hashlib.sha256(str(path).encode("utf-8")).hexdigest()
 
 
-def ingest(manifest_path, state_dir=DEFAULT_STATE) -> dict:
-    """Receive one submission; return canonical event state or a durable invalid record."""
+def receive(manifest_path, state_dir=DEFAULT_STATE) -> dict:
+    """Validate and persist a canonical event without executing its workflow."""
     path = Path(manifest_path).expanduser().absolute()
     document = None
     sources = [path]
@@ -214,8 +225,16 @@ def ingest(manifest_path, state_dir=DEFAULT_STATE) -> dict:
             return {**store.get(connection, event_id), "duplicate": False, "workflow_created": False}
     with _database(state_dir, sources) as (connection, directory):
         event_id, duplicate = _persist(connection, manifest)
-    event, created = _process(event_id, directory)
-    return {**event, "duplicate": duplicate, "workflow_created": created}
+        return {**store.get(connection, event_id), "duplicate": duplicate, "workflow_created": False}
+
+
+def ingest(manifest_path, state_dir=DEFAULT_STATE) -> dict:
+    """Receive one submission and synchronously process its canonical workflow."""
+    received = receive(manifest_path, state_dir)
+    if received["status"] == "INVALID":
+        return received
+    event, created = _process(received["id"], Path(state_dir))
+    return {**event, "duplicate": received["duplicate"], "workflow_created": created}
 
 
 def inspect_event(event_id: str, state_dir=DEFAULT_STATE) -> dict:

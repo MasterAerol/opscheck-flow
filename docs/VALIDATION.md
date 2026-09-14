@@ -1,3 +1,84 @@
+# Milestone 4 validation record
+
+Validated on **15 September 2026 (Asia/Singapore)** with **Python 3.12.10 on Windows**, on `feature/worker-queue-leasing`. The branch starts at `5bbe83b`, the merged Milestone 3 main history. No previous tests were removed or weakened.
+
+## Automated results
+
+Executed: `py -3.12 -m unittest discover -s tests -v`
+
+| Result | Count |
+| --- | ---: |
+| Total | **217** |
+| Passed | **215** |
+| Failed/errors | **0** |
+| Skipped | **2** |
+
+The final full run completed in **63.754 seconds**. Both skips are the existing Windows symlink-privilege skips from Milestones 1–3. All 174 pre-existing tests are retained, and 43 new queue tests passed. A first full run exposed an incorrect new crash-test assumption: a parallel specialist interrupted before its success transaction commits may legitimately execute again. The corrected test snapshots persisted task state and proves that saved successful attempts do not repeat while incomplete attempts may retry. The complete suite was rerun successfully after that correction.
+
+The new tests cover enqueue without execution, duplicate/renamed manifests, invalid diagnostics, queued scans, synchronous/queued order, atomic reservation rollback and interleaving, priority, delayed availability, secure tokens, attempt evidence, heartbeat renewal, lease expiry, stale heartbeat/completion/failure rejection, retry/backoff, dead-letter and replay history, terminal revision failures, source restoration, report failures, approval/revision continuity, input protection, CLI validation, polling, maximum claims, Ctrl+C cleanup, connection closure, and schema-initialization failure cleanup.
+
+Real subprocess tests exercised two workers racing for one job and two workers holding different jobs simultaneously. They use stdin barriers, not winner-timing sleeps. Crash tests terminated real processes after claim, during specialists, after the approval checkpoint before queue settlement, and after approval success before publication. Recovery retained one run and one approval; successful persisted specialists were not repeated. A live-work test held a specialist behind a synchronization event, expired its lease, and proved the new owner deferred behind the original event/run lock while stale settlement was rejected.
+
+Heartbeat tests drove the actual background renewal loop through controlled interval boundaries, advanced a patchable UTC clock, and verified ownership beyond the original lease expiry with no heartbeat audit spam. Stale tokens could not mutate the replacement owner's job. An advancing-clock regression confirms that expiry reconciliation and the next claim work in one transaction even as wall-clock time advances. Background threads were joined and their SQLite connections explicitly closed.
+
+## Clean CLI demonstration
+
+Fresh isolated state was created beneath `.opscheck/milestone4-release-7e22f4a2ed094c99a694a95bd07ffd92/manual-final`. Existing user data was not deleted. The commands ran as separate Python processes, with transcripts and summaries kept only in ignored QA state.
+
+- Main demo job: `job_7af6335ba72a4e3d860a54f2205eb0df`
+- Canonical event: `evt_4e019edda4f74534852232ee1604d731`
+- Reserved run: `0e20296cdc8c48e092059f39452c7da4`
+- Replayed dead-letter job: `job_e2edd4495a284e3ea049112cfe9db0a1`
+- Replayed reserved run: `c20fae1ea1484634a292997fe668194f`
+
+| Check | Observed result |
+| --- | --- |
+| Enqueue | QUEUED; one event, one job, zero workflow rows, zero tasks |
+| First worker | WAITING_FOR_APPROVAL; one canonical run |
+| Duplicate enqueue | Same job/event/run; job_created false |
+| Two queued scans | Zero new queue jobs in both scans |
+| Two-worker race | One WAITING_FOR_APPROVAL result and one EMPTY result; one delivery attempt |
+| Heartbeat | Extended expiry; competitor excluded beyond original expiry, using a controlled clock |
+| Stale token | Heartbeat, completion, and failure rejected after replacement claim |
+| Worker crash | Real process exit 23 after claim; real five-second lease expiry; next CLI worker recovered the same run on attempt 2 |
+| Recoverable delivery failure | Demo CLI injection returned exit 2 and requeued |
+| Dead-letter | Three failures with real 1/2-second backoff; DEAD_LETTER with three attempt records |
+| Replay | Same job/event/run, replay_count 1, budget reset, lifetime attempt 4 reached approval |
+| Approval by Aerol | Both normal and replayed flows reached queue SUCCEEDED, event COMPLETED, workflow SUCCEEDED |
+| Specialist evidence | Quality and change each retained one attempt; audit records unchanged through approval |
+
+## SQLite, packaging, and installed smoke
+
+Tests explicitly checked closed connections and Windows database deletion after enqueue, failure, dead-letter, replay, successful delivery, approval, heartbeat renewal, and initialization failure. No WinError 32 was observed. All transient demo databases, locks, reports, logs, environments, distributions, and caches remain ignored.
+
+An isolated Python 3.12 PEP 517 build produced both `opscheck-0.1.0.tar.gz` and `opscheck-0.1.0-py3-none-any.whl`; the wheel was built from the source distribution. The wheel was installed with `pip install --no-deps` into a fresh virtual environment. `scripts/smoke_installed.py` ran commands in a temporary directory outside the source checkout with `PYTHONPATH` removed. The reported import location was that environment's `Lib/site-packages/opscheck/__init__.py`.
+
+All installed smoke flows passed: the existing workflow retry/rejection/approval flow, Milestone 3 ingestion/idempotency, and the new enqueue-without-execution → duplicate/same job → delivery failure/backoff → worker → human approval → queue SUCCEEDED/event COMPLETED flow. A repeated installed queued scan created zero new jobs.
+
+`git diff --check` passed. Runtime artifacts and credentials were not added to the intended source changes. The finalization QA gate passed; publication status is reported separately. No merge was performed.
+
+## Finalization rerun
+
+The authorized finalization reran the complete suite, built both package formats, and performed the full CLI lifecycle in fresh isolated state. Duplicate enqueue was checked before the first worker ran: it retained exactly one event/job/reservation and zero runs/tasks. Queue inspection verified persisted availability, empty lease metadata, replay count, and audit history.
+
+The separate rejection demonstration persisted `revision_agent_1` as succeeded, retained the original event/job/run and one queue delivery, and then approved the revised briefing. Specialist audit records were unchanged. Real worker crashes, the synchronized two-worker race, controlled-clock heartbeat and stale heartbeat/completion/failure/requeue rejection, real retry backoff, dead-letter inspection, and replay all passed.
+
+Ten new disposable SQLite stores verified actual Windows database deletion after enqueue, duplicate enqueue, claim, heartbeat (including a joined background renewal thread), worker success, worker failure, requeue, dead-letter, replay, and human approval. No user state was deleted.
+
+The wheel was installed into a fresh virtual environment under the Windows temporary directory, physically outside the source checkout. The smoke runner also started outside the checkout; all package commands ran from separate temporary working directories and imported the temporary environment's site-packages copy. Smoke coverage now explicitly includes both a successful `worker --once` lifecycle and the retained delivery retry/backoff lifecycle, with final queue, event, and workflow state assertions. No workflow implementation fixes were required during finalization.
+
+GitHub CLI was unavailable. The intended diff was reviewed, credential-pattern checks found no matches, and runtime/build artifacts remain ignored.
+
+## Verification limits
+
+- Local execution covered Windows Python 3.12.10. Ubuntu Python 3.10/3.12/3.14 and POSIX symlink behavior await CI verification.
+- The existing GitHub Actions matrix and installed-smoke invocation were retained. No remote Milestone 4 Actions run was started or claimed to pass.
+- No live model server was tested; existing fake-model/adapter tests passed. Queue manifests retain deterministic local execution.
+- Long-running worker mode, bounded claims, idle polling, and interrupt cleanup were implemented and exercised. Prolonged unattended operation was not tested.
+- Coordination is local SQLite plus local OS locks, with a sufficiently consistent system clock. No distributed consensus, network queue server, network-filesystem guarantee, or multi-machine lease guarantee is claimed.
+
+---
+
 # Milestone 3 validation record
 
 Validated on **15 September 2026 (Asia/Singapore)** with **Python 3.12.10 on Windows**. Branch: `feature/event-ingestion-idempotency`.
