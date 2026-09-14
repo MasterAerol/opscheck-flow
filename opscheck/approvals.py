@@ -169,8 +169,10 @@ def _saved_run(run_id: str, state_dir: Path):
 def inspect_run(run_id: str, state_dir=Path(".opscheck/runs")) -> dict:
     """Return a consistent database snapshot without reading reports or source CSVs."""
     with _saved_run(run_id, state_dir) as (connection, directory, _, _):
-        connection.execute("BEGIN")
+        from .event_store import synchronize
+        connection.execute("BEGIN IMMEDIATE")
         with connection:
+            synchronize(connection, run_id)
             return _result(connection, run_id, directory)
 
 

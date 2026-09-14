@@ -1,0 +1,8 @@
+{
+  "event_type": "orders_check",
+  "input": "data/orders-messy.csv",
+  "rules": "data/rules.json",
+  "before": "data/orders-before.csv",
+  "after": "data/orders-after.csv",
+  "key": "order_id"
+}

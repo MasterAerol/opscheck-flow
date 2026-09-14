@@ -43,6 +43,31 @@ def main() -> None:
         assert "Approval History" in html and escape(feedback) in html and "<script" not in html
         print("PASS: installed retry -> pause -> reject -> revise -> approve; immutable history and escaped HTML.")
 
+        # Obtain fixtures through the installed package resource API in a fresh
+        # subprocess. No repository-relative paths participate in this smoke test.
+        prepare = '''
+from importlib import resources
+from pathlib import Path
+source = resources.files("opscheck").joinpath("examples", "inbox")
+inbox = Path("inbox")
+(inbox / "data").mkdir(parents=True)
+(inbox / "job.opscheck.json").write_bytes(source.joinpath("job-001.opscheck.json").read_bytes())
+for name in ("orders-messy.csv", "orders-before.csv", "orders-after.csv", "rules.json"):
+    (inbox / "data" / name).write_bytes(source.joinpath("data", name).read_bytes())
+'''
+        subprocess.run([sys.executable, "-c", prepare], cwd=directory, env=environment, check=True)
+        assert "WAITING_FOR_APPROVAL" in command("ingest", "inbox/job.opscheck.json")
+        event = json.loads(command("events"))
+        event_run = event["workflow_run_id"]
+        assert "Duplicate event detected" in command("ingest", "inbox/job.opscheck.json")
+        replay = json.loads(command("events"))
+        assert replay["id"] == event["id"] and replay["workflow_run_id"] == event_run
+        assert replay["duplicate_count"] == 1
+        assert "SUCCEEDED" in command("approve", event_run, "--reviewer", "Package QA")
+        assert "Status: COMPLETED" in command("event", event["id"])
+        assert "Workflows created: 0" in command("scan", "inbox")
+        print("PASS: installed event ingest -> duplicate/same run -> approve -> event COMPLETED; rescan creates zero workflows.")
+
 
 if __name__ == "__main__":
     main()

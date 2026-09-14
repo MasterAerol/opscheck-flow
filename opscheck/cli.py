@@ -67,6 +67,18 @@ def _parser() -> argparse.ArgumentParser:
     flow_demo = commands.add_parser("flow-demo", help="demonstrate parallel workers, retry, and saved state")
     flow_demo.add_argument("--resume", metavar="RUN_ID")
     runs = commands.add_parser("runs", help="list saved workflow runs")
+    event_commands = []
+    for name, help_text in (("ingest", "ingest a JSON job manifest"), ("scan", "scan an inbox once for *.opscheck.json"),
+                            ("events", "list durable ingestion events"), ("event", "inspect an ingestion event and audit history"),
+                            ("retry-event", "retry or recover a reserved event workflow")):
+        command = commands.add_parser(name, help=help_text)
+        if name == "ingest":
+            command.add_argument("manifest", type=Path)
+        elif name == "scan":
+            command.add_argument("inbox", type=Path)
+        elif name in ("event", "retry-event"):
+            command.add_argument("event_id")
+        event_commands.append(command)
     approval_commands = []
     for name in ("approve", "reject", "approvals", "run", "resume"):
         command = commands.add_parser(name, help={
@@ -83,7 +95,7 @@ def _parser() -> argparse.ArgumentParser:
         if name == "resume":
             command.add_argument("--max-attempts", type=int, default=2)
         approval_commands.append(command)
-    for command in (flow, flow_demo, runs, *approval_commands):
+    for command in (flow, flow_demo, runs, *approval_commands, *event_commands):
         command.add_argument("--state-dir", type=Path, default=Path(".opscheck/runs"))
     for command in (flow, flow_demo):
         command.add_argument("--max-human-revisions", type=int, default=3,
@@ -213,9 +225,57 @@ def _human_command(args: argparse.Namespace) -> int:
     return 2 if args.command in ("reject", "resume") and result["status"] == "FAILED" else 0
 
 
+def _print_event(event: dict, history: bool = False) -> None:
+    if event.get("duplicate"):
+        print("Duplicate event detected. Reusing the canonical event and reserved run.")
+    print(f"Event: {event['id']}\nStatus: {event['status']}")
+    print(f"External event ID: {event['event_id']!r}\nEvent type: {event['event_type']!r}")
+    print(f"Fingerprint: {event['fingerprint'] or '-'}\nManifest: {event['manifest_path']!r}")
+    print(f"Run: {event['workflow_run_id'] or '-'}\nWorkflow status: {event['workflow_status'] or 'Not created'}")
+    print(f"Duplicate count: {event['duplicate_count']}\nRetryable: {event['retryable']}")
+    for key in ("received_at", "updated_at", "claimed_at", "completed_at"):
+        print(f"{key}: {event[key] or '-'}")
+    if event['error']:
+        print(f"Error: {event['error']!r}")
+    if event.get('processing_error') and event['processing_error'] != event['error']:
+        print(f"Processing error saved in audit history: {event['processing_error']!r}")
+        print("The workflow checkpoint is saved. Fix the filesystem issue and use resume RUN_ID to rebuild reports.")
+    if history:
+        print("External IDs: " + json.dumps(event["external_event_ids"], ensure_ascii=True))
+        print("Audit history:")
+        for entry in event["history"]:
+            print(json.dumps(entry, ensure_ascii=True, sort_keys=True))
+
+
+def _event_command(args: argparse.Namespace) -> int:
+    from .ingestion import ingest, inspect_event, list_events, retry_event, scan
+    if args.command == "events":
+        for event in list_events(args.state_dir):
+            print(json.dumps({key: event[key] for key in
+                  ("id", "event_id", "status", "workflow_run_id", "duplicate_count", "error")}, ensure_ascii=True))
+        return 0
+    if args.command == "scan":
+        result = scan(args.inbox, args.state_dir)
+        for event in result["events"]:
+            print(json.dumps({key: event.get(key) for key in ("id", "manifest_path", "status", "workflow_run_id", "error", "processing_error")}, ensure_ascii=True))
+        for key in ("scanned", "new_events", "duplicates", "invalid", "failed", "workflows_created"):
+            print(f"{key.replace('_', ' ').capitalize()}: {result[key]}")
+        return 2 if result["invalid"] or result["failed"] else 0
+    if args.command == "ingest":
+        event = ingest(args.manifest, args.state_dir)
+    elif args.command == "retry-event":
+        event = retry_event(args.event_id, args.state_dir)
+    else:
+        event = inspect_event(args.event_id, args.state_dir)
+    _print_event(event, history=args.command == "event")
+    return 2 if args.command != "event" and (event["status"] in ("INVALID", "FAILED") or event.get("processing_error")) else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.command in ("ingest", "scan", "events", "event", "retry-event"):
+            return _event_command(args)
         if args.command == "demo":
             return _demo(args.out_dir)
         if args.command in ("flow", "flow-demo"):

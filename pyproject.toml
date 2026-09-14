@@ -27,4 +27,4 @@ opscheck = "opscheck.cli:main"
 include = ["opscheck*"]
 
 [tool.setuptools.package-data]
-opscheck = ["examples/*.csv", "examples/*.json"]
+opscheck = ["examples/*.csv", "examples/*.json", "examples/inbox/*.json", "examples/inbox/data/*.csv", "examples/inbox/data/*.json"]

@@ -121,6 +121,85 @@ Use `py -3.12 -m opscheck resume RUN_ID` to recover an interrupted process using
 
 Reports are derived artifacts. If a report write fails after a decision commits, the decision remains saved; resolve the filesystem problem and run `resume RUN_ID` to regenerate reports. Do not resubmit the decision. SQLite connections close explicitly, and OS locks release on process exit, including crashes.
 
+## Event-Triggered Workflows
+
+An inbox job manifest starts the same durable workflow used by `flow` and `flow-demo`. Ingestion has its own SQLite event record, audit history, content identity, and reserved workflow ID. Replaying an event reuses its canonical run, including its existing human approval history.
+
+Try the packaged synthetic inbox from a source checkout:
+
+```powershell
+py -3.12 -m opscheck ingest opscheck/examples/inbox/job-001.opscheck.json
+py -3.12 -m opscheck events
+
+# Replace these with the Event and Run values printed above.
+$eventId = 'PASTE_EVENT_ID'
+$runId = 'PASTE_RUN_ID'
+py -3.12 -m opscheck event $eventId
+
+# Expected: Duplicate event detected; same event and run.
+py -3.12 -m opscheck ingest opscheck/examples/inbox/job-001.opscheck.json
+
+# Existing human approval commands continue to apply.
+py -3.12 -m opscheck reject $runId --reviewer "Aerol" --comment "Explain changed records."
+py -3.12 -m opscheck approve $runId --reviewer "Aerol"
+py -3.12 -m opscheck event $eventId
+# Expected: Status: COMPLETED
+
+# One-shot inbox processing; repeated scans create no duplicate runs.
+py -3.12 -m opscheck scan opscheck/examples/inbox
+py -3.12 -m opscheck scan opscheck/examples/inbox
+```
+
+Use `--state-dir PATH` consistently on ingestion, scanning, inspection, retry, and human decision commands when you want a separate store. On Linux, use `python3` instead of `py -3.12`. The demo inbox lives under `opscheck/examples/` so its manifest and synthetic data can also ship in the wheel. The installed-package smoke test copies those resources into a temporary inbox; it does not depend on checkout files.
+
+### Manifest contract
+
+```json
+{
+  "event_type": "orders_check",
+  "input": "data/orders-messy.csv",
+  "rules": "data/rules.json",
+  "before": "data/orders-before.csv",
+  "after": "data/orders-after.csv",
+  "key": "order_id",
+  "event_id": "customer-import-2026-09-15-001"
+}
+```
+
+The first five fields are required. `key` defaults to `order_id`; `event_id` is optional. All fields must be nonblank strings. Only `orders_check` is supported. Unknown fields, duplicate JSON keys, nonstandard numeric constants, malformed JSON, and invalid paths are rejected. A manifest is limited to 64 KiB, each source file to 10 MiB, and the key/external event ID to 256 characters. There are no dynamic imports, shell commands, model endpoints, or executable expressions in this format.
+
+Paths are relative to the manifest's directory, with Windows or forward-slash separators accepted. Resolved sources must be regular files beneath that directory. Absolute/drive paths, alternate data streams, and traversal or symlinks escaping the directory are rejected. Put shared data in a subdirectory of the inbox. Existing input, SQLite-sidecar, and lock-file protections still apply.
+
+### Exact duplicate semantics
+
+The fingerprint is SHA-256 over canonical JSON containing an identity-format version, event type, normalized comparison key, and SHA-256 hashes of the four source roles. It includes source bytes, including rule bytes; it excludes manifest filenames, source locations, JSON formatting, and external delivery IDs. Therefore renamed manifests, copied data directories, and equivalent manifest formatting resolve to the same canonical event. Changing a processing key or any source bytes produces a new fingerprint. Reformatting a rule file changes its bytes and therefore its fingerprint.
+
+Every supplied external `event_id` is permanently bound to the canonical fingerprint in an alias table. Reusing it with identical content returns the existing event. Reusing it with different content creates an inspectable `INVALID` conflict record and creates no workflow. Different external IDs with identical job content become aliases of the same canonical event. Inspection lists all registered aliases.
+
+SQLite unique constraints and a `BEGIN IMMEDIATE` transaction enforce identity across processes. A claim transaction reserves a run ID before execution; it can never be replaced. An OS-owned event lock spans processing, while the existing workflow lock protects execution. A concurrent duplicate returns saved state and never schedules a second run. If the first process has not yet committed its claim, that response may show `VALIDATED` and no run ID; inspect the event again for its committed reservation.
+
+Duplicate submissions increment `duplicate_count` on the canonical event and append an audit entry containing their submission path. They do not create separate duplicate event rows. Invalid replays reuse a diagnostic identity derived from manifest location, a bounded raw-content hash, and the validation error; they remain `INVALID`. Correcting a manifest allows a valid canonical event to be created. Unsafe or unwritable state destinations may prevent durable error recording; the CLI reports the error without overwriting inputs.
+
+### Scanning, recovery, and inspection
+
+`scan` processes **only top-level `*.opscheck.json` entries**, sorted by filename. It is nonrecursive and one-shot. Plain `rules.json` files are not treated as jobs. Direct `ingest` accepts any JSON filename. Each manifest is processed independently, and the summary includes scanned entries, new events, duplicates, invalid entries, failures, and workflows created. A second scan normally reports zero workflows created. Invalid repeated submissions count as invalid entries, not successful duplicates. Watch mode is not implemented.
+
+Valid events follow `RECEIVED → VALIDATED → CLAIMED → WORKFLOW_CREATED → WAITING_FOR_APPROVAL → COMPLETED`. Rejection keeps the linked run and its approval loop. Execution failures produce `FAILED`; validation failures produce `INVALID`. Run status remains authoritative for execution. Event/run inspection, workflow reporting, approval/rejection, and duplicate processing synchronize the event's derived status. Audit entries are appended only when status changes.
+
+If processing crashes after receipt, claim, or run creation, re-ingest or rescan the unchanged job to recover the same reserved run. To explicitly retry a recoverable failure or interrupted event:
+
+```powershell
+py -3.12 -m opscheck retry-event $eventId
+```
+
+Failed jobs do not automatically retry on every scan. Retry reuses the reserved run and successful worker outputs. Before data checks complete, original inputs and settings must still match the fingerprint saved at receipt; if files changed, restore the original bytes to retry that event. New content without a reused external ID is a new logical event. Once the briefing is verified and saved, recovery uses Milestone 2's persisted briefing/revision state even if source files have moved.
+
+`INVALID`, `COMPLETED`, and `WAITING_FOR_APPROVAL` events cannot be retried. Waiting events need the existing approve/reject commands. Human revision-limit failures are terminal and cannot be reset by event retry. A report-write failure does not undo a committed workflow decision; use the existing `resume RUN_ID` after fixing the filesystem issue to rebuild reports. The ingestion audit retains the recorded processing error.
+
+`events` prints one JSON object per stored event, including ID, status, linked run, and duplicate count. `event EVENT_ID` shows configuration identity, source manifest, external aliases, timestamps, error, and ordered audit history. Arbitrary human/manifest strings are escaped in terminal output and HTML; manifests are not exposed as clickable arbitrary file links in reports.
+
+This guarantees **at-most-one canonical workflow per event fingerprint within a shared local SQLite state store**. It is local durable coordination, not distributed exactly-once processing. Independent state directories have independent identities; network filesystems, cross-machine leases, authenticated event producers, and a background daemon are outside this milestone.
+
 ## Optional local model subagents
 
 If you already have a model running on a compatible local server, add its chat-completions endpoint and installed model name:
@@ -195,7 +274,9 @@ Headers and keys are case-sensitive. Comparison trims only the matching key; sha
 | `compare` | No record or schema changes | Changes found | Invalid input or I/O |
 | `demo` | Reports generated successfully | — | Demo or I/O error |
 | `flow`, `flow-demo`, `resume`, `approve`, `reject` | Paused for approval or completed with human approval | — | Workflow failed, invalid configuration, or I/O error |
-| `runs`, `run`, `approvals` | State inspection succeeded | — | State or I/O error |
+| `runs`, `run`, `approvals`, `events`, `event` | State inspection succeeded | — | State or I/O error |
+| `ingest`, `retry-event` | Accepted/reused event, processing, approval pause, or completion | — | Invalid/conflicting event, execution failure, invalid retry, or I/O error |
+| `scan` | All eligible submissions accepted/reused | — | At least one invalid/failed entry, or inbox/state error |
 
 Exit `1` from the intentionally messy standalone validation is expected. Workflow commands return `0` after successfully identifying those same business problems; inspect the embedded quality and comparison results before making an operational decision.
 
