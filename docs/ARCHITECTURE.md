@@ -2,7 +2,24 @@
 
 OpsCheck Flow separates a useful deterministic data tool from the orchestration around it. This keeps the workflow inspectable: every data-quality conclusion comes from a rule or a comparison, and optional model recommendations refer to that evidence.
 
-## Modules and boundaries
+[README](../README.md) · [CLI guide](CLI_GUIDE.md) · [Validation](VALIDATION.md)
+
+## Contents
+
+1. [System overview](#system-overview)
+2. [Workflow DAG](#workflow-dag)
+3. [Durable state](#durable-state)
+4. [Human decision boundary](#human-decision-boundary)
+5. [Event ingestion and idempotency](#event-ingestion-and-idempotency)
+6. [Queue model](#queue-model)
+7. [Lease and fencing model](#lease-and-fencing-model)
+8. [Crash recovery](#crash-recovery)
+9. [Dead letters and replay](#dead-letters-and-replay)
+10. [Optional model subagents](#optional-model-subagents)
+11. [Security boundaries](#security-boundaries)
+12. [Limitations](#limitations)
+
+## System overview
 
 | Module | Responsibility |
 | --- | --- |
@@ -11,6 +28,8 @@ OpsCheck Flow separates a useful deterministic data tool from the orchestration 
 | `opscheck/manifests.py` | Strict manifest parsing, path containment, source hashes, and event identity |
 | `opscheck/event_store.py` | Event schema, SQLite constraints, audit log, and derived workflow status |
 | `opscheck/ingestion.py` | Receipt/deduplication, atomic claiming and run reservation, recovery, and one-shot scanning |
+| `opscheck/queue.py`, `opscheck/queue_store.py` | Queue API, jobs, claims, leases, fencing, attempts and replay |
+| `opscheck/worker.py` | Delivery execution and heartbeat lifecycle |
 | `opscheck/approvals.py` | Approval schema, atomic decisions, durable checkpoints, revision recovery, and inspection |
 | `opscheck/revision.py` | Deterministic clarification using verified evidence and human feedback |
 | `opscheck/artifacts.py` | Input protection and atomic report replacement under the run lock |
@@ -22,7 +41,7 @@ OpsCheck Flow separates a useful deterministic data tool from the orchestration 
 
 The `python -m opscheck` entry point invokes the CLI. Source execution needs no installation, and installed packages include the demo resources.
 
-## Planning and parallel execution
+## Workflow DAG
 
 The planner emits a fixed dependency graph. It declares what must finish before each task is eligible to execute; it does not use a model to choose tools dynamically.
 
@@ -44,7 +63,7 @@ flowchart TD
 
 The verifier uses the same core engines, so shared engine bugs remain possible. Its purpose is to catch inconsistent outputs and orchestration mistakes, not to act as an independently implemented proof of correctness. Concurrency tests use barriers to establish overlap rather than comparing wall-clock benchmarks.
 
-## Task state and bounded recovery
+### Task state and bounded recovery
 
 A task may be `pending`, `running`, `succeeded`, `failed`, or `blocked`. Ready tasks start; a successful task unlocks its dependents. A non-recoverable failure, or a transient failure that exhausts the allowance, blocks downstream tasks while preserving successful independent work.
 
@@ -54,7 +73,17 @@ Retryable failures include explicit demo fault injection and temporary model tra
 
 Important events include `task_started`, `task_succeeded`, `task_failed`, `task_retrying`, and `task_reused`. Ordered events expose what occurred, including a failed first attempt that was later recovered. Timestamps describe execution history; they are not a performance guarantee.
 
-## Persistence, identity, and locks
+### Core engine semantics
+
+CSV decoding accepts UTF-8 and an optional BOM. The loader rejects missing/blank/duplicate headers, malformed rows, width mismatches, files over 10 MiB, and more than 100,000 records. A header-only CSV is valid. Rows are represented as dictionaries of strings; no source data is mutated.
+
+Validation loads a strict versioned JSON schema. It trims outer value whitespace for checks and uses `Decimal` for finite numeric comparisons. Optional blanks skip their rules. Unique fields retain a set of seen nonblank values and report subsequent duplicates. A configured missing column is a schema finding, even when its cells would be optional. Rule findings preserve their original source value and logical CSV record number.
+
+Comparison indexes each snapshot by a unique nonblank trimmed key. Shared non-key values are compared exactly. Changes are recorded once per key, with a list of changed fields; totals count records rather than cells. Added/removed columns are separate schema changes and do not inflate changed-record counts. Keys are sorted for deterministic output.
+
+The engines count every issue/change even if detailed findings are capped. The default cap is 500. This bounds result size, not processing time, and input datasets are still held in memory.
+
+## Durable state
 
 The default database is `.opscheck/runs/runs.sqlite3`.
 
@@ -71,43 +100,9 @@ The resume fingerprint includes absolute input paths, file contents, the compari
 
 An OS advisory lock prevents concurrent execution of the same run. Locks automatically release when a process exits or crashes. The small `.lock` file remains as an inert marker; its presence does not mean the run is still executing. **Do not delete lock files to recover a run.** Deleting a marker while another process holds its lock can undermine mutual exclusion. Run locking supports POSIX and Windows systems.
 
-SQLite is local state, not distributed coordination. v0.1 does not provide a queue, cross-machine worker leasing, or an encrypted data store.
+SQLite stores the workflow, approval, ingestion and queue records. The later sections describe the event and queue tables. Coordination remains local; cross-machine leasing and application-level encryption are not provided.
 
-## Optional model subagents
-
-Default briefing generation uses code. When a loopback model server is explicitly configured, the briefing step calls an analyst and a reviewer with separate role contexts. They may use the same underlying model; separate contexts do not guarantee independent judgment.
-
-```mermaid
-flowchart TD
-    E[Verified evidence] --> A[Analyst]
-    A --> S[Schema and evidence checks]
-    S --> R[Reviewer]
-    R -->|Approved| F[Final briefing]
-    R -->|Revise within limit| A
-    R -->|Limit reached| X[Task fails]
-```
-
-`build_evidence()` preserves aggregate summaries and assigns stable IDs such as `V1` for a validation finding and `C1` for comparison evidence. Schema changes receive comparison evidence too. The adapter considers at most 20 findings per tool, bounds strings and collections, and caps the evidence payload at 64 KiB. Truncation metadata distinguishes a sampled briefing from complete tool totals.
-
-The analyst returns a JSON object with `summary` and `actions`. Every action has a title, a supported priority, and valid evidence IDs. The reviewer returns an approval decision and feedback. Rejection can lead to a revised analyst response; the limit is 1–3 rounds, defaulting to 2. A completed round normally uses two model calls. Transient transport retry can cause the enclosing briefing task to restart within the workflow's attempt limit, so total calls across retries may exceed one review loop.
-
-Malformed envelopes, invalid JSON, unknown evidence IDs, and unacceptable schemas fail the task. Even valid evidence IDs do not establish that prose is correct: an action can cite a real finding and still misinterpret it. Model reviewer approval remains a fallible judgment.
-
-The adapter accepts only an HTTP(S) loopback URL ending in `/v1/chat/completions`. It disables redirects and environment proxy use. Requests have a 30-second timeout; response bodies are limited to 128 KiB. The selected server must understand the chat-completions request format, including JSON-object response format. No model is downloaded automatically. Models have no tool-execution capability in this project.
-
-A fake local HTTP server tests the transport and response-handling behavior. That does not establish compatibility or quality for every real local model server. The initial build did not run a live local model.
-
-## Core engine semantics
-
-CSV decoding accepts UTF-8 and an optional BOM. The loader rejects missing/blank/duplicate headers, malformed rows, width mismatches, files over 10 MiB, and more than 100,000 records. A header-only CSV is valid. Rows are represented as dictionaries of strings; no source data is mutated.
-
-Validation loads a strict versioned JSON schema. It trims outer value whitespace for checks and uses `Decimal` for finite numeric comparisons. Optional blanks skip their rules. Unique fields retain a set of seen nonblank values and report subsequent duplicates. A configured missing column is a schema finding, even when its cells would be optional. Rule findings preserve their original source value and logical CSV record number.
-
-Comparison indexes each snapshot by a unique nonblank trimmed key. Shared non-key values are compared exactly. Changes are recorded once per key, with a list of changed fields; totals count records rather than cells. Added/removed columns are separate schema changes and do not inflate changed-record counts. Keys are sorted for deterministic output.
-
-The engines count every issue/change even if detailed findings are capped. The default cap is 500. This bounds result size, not processing time, and input datasets are still held in memory.
-
-## Reports and exit status
+### Reports and exit status
 
 Standalone tools can emit text, JSON, and HTML. Flow commands persist a JSON run report, an HTML workflow report, and tool HTML reports when their results are available. Individual report writes use temporary files and replacement. This does not make all report files a single atomic transaction; an I/O failure may occur after another report was written.
 
@@ -122,7 +117,7 @@ Tool status and workflow status answer different questions:
 
 A workflow status of `SUCCEEDED` is never permission to apply a business action. v0.1 produces reviewable evidence and briefings; it does not change source records or contact external business services.
 
-## Durable human decision boundary
+## Human decision boundary
 
 `PLAN` retains the existing executable DAG of planner, parallel specialists, verifier, and briefing. The conditional approval/revision state machine follows that DAG rather than pretending a human decision is a worker future. `approval_gate` is recorded as a task with `waiting`, `succeeded`, or `failed` status. Each attempted revision has its own `revision_agent_N` task record. The public plan includes both conditional roles.
 
@@ -145,7 +140,7 @@ The default `max_human_revisions=3` means a maximum of three rejected versions, 
 
 `revision_started` and `revision_completed` events include task, iteration, and approval ID. Each successful revision retains the original summary, records feedback, orders validation or change detail first, and includes exact saved finding samples with aggregate totals and sampling disclosures. It does not revalidate changed source files, invent missing records, perform source repairs, or call an external service. A model-generated original briefing retains its original model review history; the new revision metadata explicitly identifies deterministic local revision.
 
-## Approval transactions and concurrency
+### Approval transactions and concurrency
 
 SQLite `BEGIN IMMEDIATE` serializes schema migration and decision writes. A partial unique index allows only one pending approval per run; `(run_id, iteration)` is unique. Triggers prevent changing resolved decisions, changing briefing identity/content, or deleting approval history through ordinary SQL. A local database owner can still alter the schema; this is not a tamper-proof compliance store.
 
@@ -153,13 +148,13 @@ The existing OS run lock spans decision execution, revision computation, and rep
 
 All SQLite connections close in `finally` blocks; a connection's transaction context alone is insufficient. Reports are rendered from committed state and replaced atomically per file while holding the run lock. They are not a transaction across all files. `inspect_run` reads a SQLite snapshot and does not trust reports. Individual approval snapshots remain in SQLite even if all report files are deleted.
 
-## Existing database compatibility
+### Existing database compatibility
 
 Opening a Milestone 1 database adds the approval table/indexes/triggers and nullable failure reason, and normalizes run statuses to uppercase without changing task evidence. Legacy fingerprint verification continues to use the saved version-1 configuration. Already completed historical runs remain completed and do not gain fabricated approvals. An unfinished legacy run gains the approval gate after completing its briefing, with the default three-rejection budget. No general migration framework for future incompatible schemas is claimed.
 
 Human reviewer names are asserted local metadata, not authenticated accounts. SQLite and locks coordinate one local filesystem; network filesystem and distributed operation are not supported. HTML escapes human comments, reviewer names, source evidence, and failure reasons. The optional model reviewer remains a separate boundary and can never grant human approval.
 
-## Event-triggered ingestion
+## Event ingestion and idempotency
 
 ```mermaid
 flowchart TD
@@ -241,7 +236,7 @@ Manifest sources must resolve to regular files within the manifest directory; pl
 The design provides **at-most-one canonical workflow per event fingerprint within a shared local SQLite state store**. Separate stores, independent machines, network filesystems, malicious database modifications, authenticated event production, and distributed exactly-once delivery are outside this guarantee. Connections are owned and explicitly closed in `finally` blocks, including initialization and failure paths. Reports remain disposable per-file atomic replacements derived from SQLite, not the source of ingestion history.
 
 
-## Durable worker queue
+## Queue model
 
 ```text
 Event -> Idempotency -> Queue -> Lease -> Worker -> Workflow -> Human Approval -> Completion
@@ -268,7 +263,7 @@ DEAD_LETTER --explicit replay, if replayable--> QUEUED (new budget)
 
 `ingestion.receive` shares Milestone 3 parsing, source containment, content identity, alias/conflict handling, and durable receipt without execution. After receipt, enqueue uses `BEGIN IMMEDIATE` to reserve a run and create its one queue job in a single transaction. A crash before that commit leaves a receipt recoverable by another enqueue; after commit the reservation and job are both durable. `ingestion.reserve` is also used by synchronous claims and reads the current reservation under the write transaction, so even a claim that observed the event before enqueue cannot replace the saved ID. Duplicate enqueue preserves the first job's priority and budget.
 
-### Claim, heartbeat, and fencing
+## Lease and fencing model
 
 A claim takes `BEGIN IMMEDIATE` and captures one UTC expiration cutoff. It first reconciles successful workflow checkpoints for leases expired at that cutoff, recording WAITING_FOR_APPROVAL or SUCCEEDED without a delivery failure or retry. It then handles remaining leases expired at the same cutoff as EXPIRED attempts, requeuing immediately if budget remains or dead-lettering at the limit. Using one cutoff prevents a lease that expires between these phases from being incorrectly charged as a failure despite a committed checkpoint. It then selects one eligible QUEUED job by highest priority, earliest availability, creation time, and ID. Eligibility is refreshed after expiry processing so clock advancement within the transaction does not postpone the recovered job. Claiming writes LEASED, `secrets.token_hex(32)`, owner, expiry, start time, incremented lifetime/budget counts, and the attempt/audit records before committing.
 
@@ -276,7 +271,19 @@ Heartbeat and result settlement acquire a write transaction, require matching jo
 
 A worker starts a non-daemon heartbeat thread and renews every lease_seconds/3, using separately owned SQLite connections closed after each renewal. If renewal fails, the worker records the local loss and refuses result settlement. Already running Python computation is not forcibly killed. The existing event lock and workflow run lock span actual execution/recovery; they prevent a new lease holder from concurrently mutating the same workflow. A competing worker gets RunBusyError and safely defers, keeping an auditable lifetime attempt but refunding that deferral's budget charge. Ctrl+C joins the heartbeat and requeues an owned interrupted delivery. Process death releases the OS locks; the lease remains durable until expiration/reconciliation.
 
-### Workflow authority and recovery
+## Crash recovery
+
+| Failure | Recovery |
+| --- | --- |
+| Temporary task failure | Retry within the workflow invocation's task allowance |
+| Process crash during workflow | Resume the same run; reuse committed successful tasks |
+| Worker crash while leased | After expiration, reconcile saved success or reclaim incomplete work |
+| Duplicate event | Return the canonical event/run, without creating another workflow |
+| Rejected briefing | Deterministic revision and a new approval version within the human budget |
+| Repeated delivery failure | Backoff until budget exhaustion, then retain a dead letter |
+| Operator retries a replayable dead letter | New delivery budget, same job/event/run and retained history |
+| Report write failure | Fix the destination and regenerate derived reports from SQLite using resume |
+
 
 `worker._execute` calls the existing ingestion recovery entry point with explicit busy propagation and delivery retry behavior. It does not reimplement agents, verification, retry, approval, or revision. It checks reserved identity and supported saved workflow configuration before starting. Completed tasks remain saved; an incomplete task may legitimately repeat after a crash. Once a briefing exists, the existing approval-aware resume path uses its saved evidence even if source files moved.
 
@@ -286,12 +293,48 @@ Released queue jobs synchronize during workflow/event publication and inspection
 
 Reports are disposable. After settlement the worker refreshes compact queue metadata under the existing run lock without executing workflow tasks. A report I/O error returns an error but cannot undo a committed approval checkpoint or create another run; a delivery-warning audit entry retains publication failure evidence. Inspection/explicit resume can recover or regenerate artifacts.
 
-### Delivery budgets and operational scope
+## Dead letters and replay
 
 Failures use 1, 2, 4, 8... second deterministic backoff, capped at 60 seconds. `max_attempts` is 1–10 per delivery budget; `budget_attempts` counts toward that limit and `attempts` counts lifetime claims. Expired attempts consume budget. Expected lock deferrals refund only their budget charge. Exhaustion records DEAD_LETTER, error type/message, timestamp, and audit evidence. Replay is allowed only for replayable dead letters, increments replay_count, resets budget_attempts, and optionally changes max_attempts while retaining all identities/history. Unsupported immutable execution identity and human revision exhaustion refuse replay. CSV business findings are not delivery errors.
 
 Synchronous ingest and enqueue share the same canonical event and reservation in either order. Enqueue after a completed or paused synchronous run simply reflects that workflow without rerunning it. Explicit synchronous ingest/retry/resume remains available even for queued events; queue budgets bound automatic worker deliveries, not authorized manual workflow operations.
 
-Long-running mode polls rather than busy-spinning when empty. `--max-jobs` counts successful claims, including failures/deferrals, and keeps waiting if the queue has fewer eligible jobs. `--once` takes precedence. CLI exit codes and runnable PowerShell demos are documented in README. Demo failure injection is a worker CLI flag only, never a manifest field or executable hook.
+Long-running mode polls rather than busy-spinning when empty. `--max-jobs` counts successful claims, including failures/deferrals, and keeps waiting if the queue has fewer eligible jobs. `--once` takes precedence. CLI exit codes are in the [CLI guide](CLI_GUIDE.md); runnable PowerShell walkthroughs are in the [demo guide](DEMO_GUIDE.md). Demo failure injection is a worker CLI flag only, never a manifest field or executable hook.
 
 All state writes reuse existing SQLite/sidecar/source protection. Manifest values never select code, SQL identifiers, executable commands, or output links. Queue HTML and CLI metadata are escaped. Connections close explicitly on success, failure, initialization error, and heartbeat paths. Schema additions preserve existing Milestone 1–3 tables and behavior. This is durable local multi-process queue coordination using one shared SQLite state store and local OS locks, with a sufficiently consistent local clock. Network filesystems, independent machines, distributed consensus, global exactly-once processing, and an external network queue are not supported.
+
+## Optional model subagents
+
+Default briefing generation uses code. When a loopback model server is explicitly configured, the briefing step calls an analyst and a reviewer with separate role contexts. They may use the same underlying model; separate contexts do not guarantee independent judgment.
+
+```mermaid
+flowchart TD
+    E[Verified evidence] --> A[Analyst]
+    A --> S[Schema and evidence checks]
+    S --> R[Reviewer]
+    R -->|Approved| F[Final briefing]
+    R -->|Revise within limit| A
+    R -->|Limit reached| X[Task fails]
+```
+
+`build_evidence()` preserves aggregate summaries and assigns stable IDs such as `V1` for a validation finding and `C1` for comparison evidence. Schema changes receive comparison evidence too. The adapter considers at most 20 findings per tool, bounds strings and collections, and caps the evidence payload at 64 KiB. Truncation metadata distinguishes a sampled briefing from complete tool totals.
+
+The analyst returns a JSON object with `summary` and `actions`. Every action has a title, a supported priority, and valid evidence IDs. The reviewer returns an approval decision and feedback. Rejection can lead to a revised analyst response; the limit is 1–3 rounds, defaulting to 2. A completed round normally uses two model calls. Transient transport retry can cause the enclosing briefing task to restart within the workflow's attempt limit, so total calls across retries may exceed one review loop.
+
+Malformed envelopes, invalid JSON, unknown evidence IDs, and unacceptable schemas fail the task. Even valid evidence IDs do not establish that prose is correct: an action can cite a real finding and still misinterpret it. Model reviewer approval remains a fallible judgment.
+
+The adapter accepts only an HTTP(S) loopback URL ending in `/v1/chat/completions`. It disables redirects and environment proxy use. Requests have a 30-second timeout; response bodies are limited to 128 KiB. The selected server must understand the chat-completions request format, including JSON-object response format. No model is downloaded automatically. Models have no tool-execution capability in this project.
+
+A fake local HTTP server tests the transport and response-handling behavior. That does not establish compatibility or quality for every real local model server. The initial build did not run a live local model.
+
+## Security boundaries
+
+Strict manifest fields cannot select code, dynamic imports, SQL identifiers or shell commands. JSON is never evaluated. Path containment, bounded sources, and state/report destination protections reject unsafe overwrites and implemented symlink/hardlink aliases. HTML and CLI output escape untrusted values. These guards complement SQLite constraints, lease tokens and OS locks; they do not sandbox a hostile local database owner.
+
+Reviewer/worker names are asserted metadata. Approval records are immutable through the normal schema, not tamper-proof against an owner who can alter it. State and reports can retain sensitive source values; the application does not encrypt them. See [SECURITY.md](../SECURITY.md).
+
+## Limitations
+
+One shared local SQLite store, local filesystem locks and a sufficiently consistent clock define the coordination scope. Independent machines, network filesystems, distributed consensus, global exactly-once computation and a network queue server are unsupported. The worker can poll queued jobs; there is no inbox watcher or time-based scheduler. The fixed DAG does not dynamically invent tools or modify business records.
+
+CSV processing is bounded but in memory. Deterministic verification reuses the same engines and can share their bugs. Human revision only clarifies saved evidence within its budget. Optional model output remains fallible and sampled; real-model quality was not tested in the local validation pass. There is no hosted SaaS, authenticated account system, formal security audit or production-customer reliability claim.
