@@ -8,7 +8,7 @@ The default workflow runs with **Python 3.10+ and zero third-party runtime depen
 
 **Status:** v0.1.0, a local CLI and Python library. The project includes synthetic data, tests, contribution templates, and a CI configuration. It does not claim production users or a live hosted deployment.
 
-**Included demo:** download or extract the project and open [docs/demo/report.html](docs/demo/report.html) in a browser to inspect a completed run with a recovered worker failure. The corrected source passes **109 automated tests** on Linux; see [the validation record](docs/VALIDATION.md) for the Windows cleanup correction and remaining verification limits.
+**Included demo:** [docs/demo/report.html](docs/demo/report.html) is the original Milestone 1 snapshot. Run `py -3.12 -m opscheck flow-demo` to generate the current human approval workflow. See [the validation record](docs/VALIDATION.md) for executed checks and platform limits.
 
 ## Try the complete workflow
 
@@ -29,9 +29,9 @@ python -m opscheck runs
 
 The quality worker fails on its first attempt, retries within the configured limit, and then succeeds. The independent comparison worker can complete while this happens. Inspect the run's ordered events and attempt counts to see the recovery.
 
-Run `python -m opscheck flow-demo --resume RUN_ID` with a printed demo ID to see successful tasks reused from saved state.
+Run `python -m opscheck flow-demo --resume RUN_ID` with a printed demo ID to inspect its saved checkpoint. A pending approval remains paused; use `approve` or `reject` to submit a human decision.
 
-The bundled example contains 10 synthetic orders. Its quality check finds 8 issues across 8 records. The comparison finds 1 added order, 1 removed order, 2 modified orders, and 7 unchanged orders. A successful workflow can contain data-quality findings: success means the pipeline completed and verified its results.
+The bundled example contains 10 synthetic orders. Its quality check finds 8 issues across 8 records. The comparison finds 1 added order, 1 removed order, 2 modified orders, and 7 unchanged orders. A successful workflow can contain data-quality findings: success means the pipeline completed, verified its results, and received human approval.
 
 ## What the workflow does
 
@@ -42,6 +42,11 @@ flowchart TD
     Q --> V[Verifier]
     C --> V
     V --> B[Briefing]
+    B --> G[Approval gate]
+    G -->|Approved| S[SUCCEEDED]
+    G -->|Rejected within limit| H[Revision agent]
+    H --> G
+    G -->|Rejection limit reached| F[FAILED]
     Q -->|Temporary failure| R[Bounded retry]
     R --> Q
 ```
@@ -53,6 +58,8 @@ flowchart TD
 | Change worker | Compare two CSV snapshots by a stable key | Deterministic Python comparison |
 | Verifier | Check result structure, counts, sources, and recomputed results | A separate deterministic verification step |
 | Briefing | Summarize verified evidence | Deterministic by default; optional analyst/reviewer model team |
+| Approval gate | Persist the human decision boundary | SQLite checkpoint; process exits normally |
+| Revision agent | Clarify the briefing using feedback and verified findings | Deterministic record-level details; no model required |
 
 SQLite stores task states, attempts, outputs, and an event history. Successful tasks are reused on resume. Input contents and relevant configuration are fingerprinted so a resumed run cannot silently mix old and new inputs. The verifier reruns the same engines; it checks consistency and orchestration integrity, not correctness through an independently developed algorithm.
 
@@ -73,6 +80,46 @@ python -m opscheck flow opscheck/examples/orders-messy.csv --rules opscheck/exam
 Replace `RUN_ID` with an existing ID; it is not a literal example run. Use `--state-dir PATH` consistently if you change the state location. `--max-attempts` accepts 1–5 and defaults to 2. This is an allowance per task for the current invocation; accumulated attempt counts remain visible across resumed invocations. Invalid CSV or rule configuration is not a temporary failure and is not retried automatically.
 
 For a repeatable failed-run demonstration, run the first command with `--fail-once quality_agent --max-attempts 1`. Resume it with the same input/configuration options and `--resume RUN_ID`. The injected failure applies only to the task's first lifetime attempt.
+
+## Human-in-the-Loop Workflows
+
+The briefing is a durable human checkpoint. OpsCheck saves a pending approval and its exact briefing in SQLite, marks the run `WAITING_FOR_APPROVAL`, writes the reports, and exits with code `0`. The engine never calls `input()` or keeps a terminal waiting. You can close PowerShell or restart the computer, then decide using the same state directory.
+
+Run states are `PENDING`, `RUNNING`, `WAITING_FOR_APPROVAL`, `SUCCEEDED`, and `FAILED`. Task states remain separate and lowercase. Neither completing the workers nor obtaining optional model reviewer approval satisfies the human requirement.
+
+Complete Windows PowerShell example (substitute the printed run ID):
+
+```powershell
+# 1. Create a briefing. Expected: WAITING_FOR_APPROVAL.
+py -3.12 -m opscheck flow-demo
+$runId = 'PASTE_PRINTED_RUN_ID'
+py -3.12 -m opscheck run $runId
+
+# 2. Request a revision. Expected: revision_agent completes, WAITING_FOR_APPROVAL.
+py -3.12 -m opscheck reject $runId --reviewer "Aerol" --comment "Please make the change summary clearer."
+
+# 3. Inspect SQLite history. Expected: #1 REJECTED, #2 PENDING.
+py -3.12 -m opscheck approvals $runId
+
+# 4. Approve the revised briefing. Expected: SUCCEEDED.
+py -3.12 -m opscheck approve $runId --reviewer "Aerol"
+py -3.12 -m opscheck run $runId
+Start-Process ".opscheck/runs/$runId/report.html"
+```
+
+Use `python` or `python3` instead of `py -3.12` on Linux. Pass `--state-dir PATH` to **every** command if you use a custom state directory. `approve` accepts optional `--reviewer` and `--comment`; `reject` requires a nonblank `--comment`. An omitted reviewer is stored as unspecified; this local CLI does not authenticate identities.
+
+Each rejection preserves the prior request, reviewer, comment, timestamps, and exact briefing snapshot. The revision agent reads saved verifier and worker results, emphasizes validation or snapshot changes according to the feedback, and adds row/ID details, issue types, values, explanations, and before/after changes. It never edits CSVs or executes feedback as instructions. Local revision also works for an initially model-assisted briefing and makes no further model calls. Arbitrary editorial requests may require human editing outside this deterministic scope.
+
+Every revision creates a **new** pending approval. `--max-human-revisions 3` (the default) allows three rejected versions total: reject v1 → v2, reject v2 → v3, reject v3 → `FAILED`. This counts rejected versions, including the original briefing; it permits at most two revisions. The configurable range is 1–20, saved with the run and immutable on resume. Limit exhaustion saves a failure reason and a `revision_limit_reached` event; resume cannot reset this budget.
+
+`run RUN_ID` shows status, active approval ID, iteration, rejection count, and report location. `approvals RUN_ID` reads immutable history from SQLite, not from report files. Each `briefing-vN.json` is a disposable copy of the exact snapshot held in the database. `report.html` shows current approval status and escaped history; reviewer names and comments display as text even when they contain HTML.
+
+For delayed or automated clients, pass `--approval-id APPROVAL_ID` from `run` to decide only the exact version reviewed. The printed approve/reject commands include it. Without it, a command targets the pending version it observes when it starts reading state. Concurrent attempts for the same version cannot both succeed; a losing command reports an already executing/completed run or no pending approval. Never retry a decision against a newer version without reviewing it.
+
+Use `py -3.12 -m opscheck resume RUN_ID` to recover an interrupted process using saved configuration. Completed specialists are reused. Pending approval remains paused; a decision committed just before a crash resumes from that decision, and a saved revision output is reused without generating another revision. Once a briefing exists, approval and revision use its persisted evidence even if original inputs have moved. Starting or resuming unfinished data checks still requires unchanged input paths, content, and configuration. Existing `flow --resume` and `flow-demo --resume` keep their input fingerprint checks.
+
+Reports are derived artifacts. If a report write fails after a decision commits, the decision remains saved; resolve the filesystem problem and run `resume RUN_ID` to regenerate reports. Do not resubmit the decision. SQLite connections close explicitly, and OS locks release on process exit, including crashes.
 
 ## Optional local model subagents
 
@@ -147,8 +194,8 @@ Headers and keys are case-sensitive. Comparison trims only the matching key; sha
 | `validate` | Data passes rules | Validation findings | Invalid input, rules, or I/O |
 | `compare` | No record or schema changes | Changes found | Invalid input or I/O |
 | `demo` | Reports generated successfully | — | Demo or I/O error |
-| `flow`, `flow-demo` | All workflow steps completed and verified | — | Workflow failed, invalid configuration, or I/O error |
-| `runs` | Run listing succeeded | — | State or I/O error |
+| `flow`, `flow-demo`, `resume`, `approve`, `reject` | Paused for approval or completed with human approval | — | Workflow failed, invalid configuration, or I/O error |
+| `runs`, `run`, `approvals` | State inspection succeeded | — | State or I/O error |
 
 Exit `1` from the intentionally messy standalone validation is expected. Workflow commands return `0` after successfully identifying those same business problems; inspect the embedded quality and comparison results before making an operational decision.
 

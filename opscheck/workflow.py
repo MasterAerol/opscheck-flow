@@ -20,6 +20,8 @@ import uuid
 
 from .core import OpsCheckError, compare, load_csv, load_rules, validate
 
+RUN_STATES = {"PENDING", "RUNNING", "WAITING_FOR_APPROVAL", "SUCCEEDED", "FAILED"}
+
 
 PLAN = {
     "planner": [],
@@ -28,6 +30,9 @@ PLAN = {
     "verifier": ["quality_agent", "change_agent"],
     "briefing_agent": ["verifier"],
 }
+
+WORKFLOW_PLAN = {**PLAN, "approval_gate": ["briefing_agent"],
+                 "revision_agent": ["approval_gate:rejected"]}
 
 
 class TransientTaskError(RuntimeError):
@@ -151,6 +156,8 @@ def _connect(path: Path) -> sqlite3.Connection:
                 detail_json TEXT NOT NULL
             );
         """)
+        from .approvals import initialize
+        initialize(connection)
     except BaseException:
         # Ownership transfers only after initialization succeeds.
         connection.close()
@@ -239,13 +246,13 @@ def _verify(quality: dict, changes: dict, paths: list[Path], config: dict,
 
 def _task_outputs(connection: sqlite3.Connection, run_id: str) -> dict:
     return {row["task_id"]: json.loads(row["output_json"])
-            for row in connection.execute("SELECT task_id,output_json FROM tasks WHERE run_id=? AND status='succeeded'", (run_id,))}
+            for row in connection.execute("SELECT task_id,output_json FROM tasks WHERE run_id=? AND status='succeeded' AND output_json IS NOT NULL", (run_id,))}
 
 
 def _run_tasks(connection: sqlite3.Connection, run_id: str, paths: list[Path], config: dict,
                fingerprint: str, max_attempts: int, fail_once: str | None) -> None:
     task_rows = connection.execute("SELECT * FROM tasks WHERE run_id=?", (run_id,)).fetchall()
-    tasks = {row["task_id"]: dict(row) for row in task_rows}
+    tasks = {row["task_id"]: dict(row) for row in task_rows if row["task_id"] in PLAN}
     outputs = _task_outputs(connection, run_id)
     allowance_used = {task: 0 for task in PLAN}
 
@@ -253,7 +260,7 @@ def _run_tasks(connection: sqlite3.Connection, run_id: str, paths: list[Path], c
         if task == fail_once and total_attempt == 1:
             raise TransientTaskError(f"Injected transient failure in {task}; retry is safe.")
         if task == "planner":
-            return {"plan": {name: list(dependencies) for name, dependencies in PLAN.items()}}
+            return {"plan": {name: list(dependencies) for name, dependencies in WORKFLOW_PLAN.items()}}
         if task == "quality_agent":
             return validate(load_csv(paths[0]), load_rules(paths[1]))
         if task == "change_agent":
@@ -323,30 +330,45 @@ def _run_tasks(connection: sqlite3.Connection, run_id: str, paths: list[Path], c
                                        (error, run_id, task))
                     state["status"] = "blocked"
                     _event(connection, run_id, "task_blocked", task, dependencies=failed_dependencies)
-            status = "succeeded" if all(state["status"] == "succeeded" for state in tasks.values()) else "failed"
-            connection.execute("UPDATE runs SET status=?,updated_at=? WHERE run_id=?", (status, _now(), run_id))
-            _event(connection, run_id, "run_completed", status=status)
+            if not all(state["status"] == "succeeded" for state in tasks.values()):
+                reason = "; ".join(row["error"] for row in connection.execute(
+                    "SELECT error FROM tasks WHERE run_id=? AND status='failed'", (run_id,)))
+                connection.execute("UPDATE runs SET status='FAILED',failure_reason=?,updated_at=? WHERE run_id=?",
+                                   (reason, _now(), run_id))
+                _event(connection, run_id, "run_completed", status="FAILED", reason=reason)
 
 
 def _result(connection: sqlite3.Connection, run_id: str, state_dir: Path) -> dict:
     run = connection.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
     by_id = {row["task_id"]: row for row in connection.execute("SELECT * FROM tasks WHERE run_id=?", (run_id,))}
+    ordered = [task for task in PLAN if task in by_id] + [task for task in by_id if task not in PLAN]
     tasks = [{"id": task, "status": by_id[task]["status"], "attempts": by_id[task]["attempts"],
-              "error": by_id[task]["error"]} for task in PLAN]
+              "error": by_id[task]["error"]} for task in ordered]
     events = [{"id": row["id"], "event": row["event"], "task": row["task"], "timestamp": row["timestamp"],
                **json.loads(row["detail_json"])}
               for row in connection.execute("SELECT * FROM events WHERE run_id=? ORDER BY id", (run_id,))]
     outputs = _task_outputs(connection, run_id)
+    from .approvals import history
+    approvals = history(connection, run_id)
+    if approvals:
+        outputs["briefing_agent"] = approvals[-1]["briefing"]
+    pending = next((item for item in approvals if item["status"] == "pending"), None)
     return {"run_id": run_id, "status": run["status"],
+            "failure_reason": run["failure_reason"], "approvals": approvals,
+            "active_approval_id": pending["id"] if pending else None,
+            "approval_iteration": approvals[-1]["iteration"] if approvals else 0,
+            "rejected_revisions": sum(item["status"] == "rejected" for item in approvals),
+            "report_path": str(state_dir / run_id / "report.html"),
             "mode": "model" if json.loads(run["config_json"])["llm_url"] else "local",
-            "plan": {task: list(dependencies) for task, dependencies in PLAN.items()}, "tasks": tasks,
+            "plan": {task: list(dependencies) for task, dependencies in WORKFLOW_PLAN.items()}, "tasks": tasks,
             "events": events, "results": {task: outputs[task] for task in ("quality_agent", "change_agent", "briefing_agent") if task in outputs},
             "state_dir": str(state_dir)}
 
 
 def run_workflow(input_path, rules_path, before_path, after_path, key="order_id",
                  state_dir=Path(".opscheck/runs"), run_id=None, max_attempts=2,
-                 fail_once=None, llm_url=None, model=None, max_rounds=2) -> dict:
+                 fail_once=None, llm_url=None, model=None, max_rounds=2,
+                 max_human_revisions=3) -> dict:
     """Execute or resume a workflow; execution failures are returned with evidence.
 
     max_attempts is the allowance per task for this invocation. Saved attempt totals
@@ -357,6 +379,8 @@ def run_workflow(input_path, rules_path, before_path, after_path, key="order_id"
         raise OpsCheckError("max_attempts must be an integer between 1 and 5.")
     if type(max_rounds) is not int or not 1 <= max_rounds <= 3:
         raise OpsCheckError("max_rounds must be an integer between 1 and 3.")
+    if type(max_human_revisions) is not int or not 1 <= max_human_revisions <= 20:
+        raise OpsCheckError("max_human_revisions must be an integer between 1 and 20.")
     if not isinstance(key, str) or not key.strip():
         raise OpsCheckError("key must be a nonblank column name.")
     if fail_once not in (None, "quality_agent", "change_agent"):
@@ -375,7 +399,8 @@ def run_workflow(input_path, rules_path, before_path, after_path, key="order_id"
     except (TypeError, ValueError) as exc:
         raise OpsCheckError("Input and state paths must be filesystem paths.") from exc
     config = {"key": key, "llm_url": llm_url, "model": model, "max_rounds": max_rounds,
-              "input_paths": [str(path) for path in paths], "workflow_version": 1}
+              "input_paths": [str(path) for path in paths], "workflow_version": 2,
+              "max_human_revisions": max_human_revisions}
     try:
         # Rules are configuration; reject malformed rules before creating run state.
         load_rules(paths[1])
@@ -391,8 +416,18 @@ def run_workflow(input_path, rules_path, before_path, after_path, key="order_id"
                     if resuming:
                         if existing is None:
                             raise OpsCheckError(f"Run {run_id} does not exist in this state directory.")
+                        saved_config = json.loads(existing["config_json"])
+                        if saved_config.get("workflow_version") == 1:
+                            legacy = {k: v for k, v in config.items() if k != "max_human_revisions"}
+                            legacy["workflow_version"] = 1
+                            fingerprint = _fingerprint(paths, legacy)
                         if existing["fingerprint"] != fingerprint:
                             raise OpsCheckError("Inputs or processing configuration changed; start a new run instead of resuming.")
+                        config = saved_config
+                        if existing["status"] in ("WAITING_FOR_APPROVAL", "SUCCEEDED") or (
+                                existing["status"] == "FAILED" and connection.execute(
+                                    "SELECT 1 FROM events WHERE run_id=? AND event='revision_limit_reached'", (run_id,)).fetchone()):
+                            return _publish_result(connection, run_id, state_dir, paths)
                         _event(connection, run_id, "run_resumed")
                         for row in connection.execute("SELECT * FROM tasks WHERE run_id=?", (run_id,)).fetchall():
                             if row["status"] == "succeeded":
@@ -402,20 +437,32 @@ def run_workflow(input_path, rules_path, before_path, after_path, key="order_id"
                                     _event(connection, run_id, "task_recovered", row["task_id"], previous_status="running")
                                 connection.execute("UPDATE tasks SET status='pending',error=NULL,output_json=NULL WHERE run_id=? AND task_id=?",
                                                    (run_id, row["task_id"]))
-                        connection.execute("UPDATE runs SET status='running',updated_at=? WHERE run_id=?", (_now(), run_id))
+                        connection.execute("UPDATE runs SET status='RUNNING',failure_reason=NULL,updated_at=? WHERE run_id=?", (_now(), run_id))
                     else:
                         timestamp = _now()
-                        connection.execute("INSERT INTO runs VALUES(?,?,?,?,?,?)",
-                                           (run_id, fingerprint, _json(config), "running", timestamp, timestamp))
+                        connection.execute("INSERT INTO runs(run_id,fingerprint,config_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                                           (run_id, fingerprint, _json(config), "PENDING", timestamp, timestamp))
                         for task in PLAN:
                             connection.execute("INSERT INTO tasks(run_id,task_id,status) VALUES(?,?,'pending')", (run_id, task))
                         _event(connection, run_id, "run_created", mode="model" if llm_url else "local")
+                        connection.execute("UPDATE runs SET status='RUNNING' WHERE run_id=?", (run_id,))
                 _run_tasks(connection, run_id, paths, config, fingerprint, max_attempts, fail_once)
-                return _result(connection, run_id, state_dir)
+                from .approvals import advance
+                advance(connection, run_id, state_dir, config)
+                return _publish_result(connection, run_id, state_dir, paths)
             finally:
                 connection.close()
     except (OSError, sqlite3.Error) as exc:
         raise OpsCheckError(f"Cannot access workflow input or state: {exc}") from exc
+
+
+def _publish_result(connection: sqlite3.Connection, run_id: str, state_dir: Path,
+                    paths: list[Path]) -> dict:
+    """Rebuild disposable reports from committed SQLite state under the run lock."""
+    from .artifacts import write_workflow_reports
+    result = _result(connection, run_id, state_dir)
+    write_workflow_reports(result, paths)
+    return result
 
 
 def list_runs(state_dir=Path(".opscheck/runs")) -> list[dict]:
@@ -430,7 +477,7 @@ def list_runs(state_dir=Path(".opscheck/runs")) -> list[dict]:
         connection = sqlite3.connect(database.as_uri() + "?mode=rw", uri=True, timeout=10)
         connection.row_factory = sqlite3.Row
         try:
-            return [{"run_id": row["run_id"], "status": row["status"],
+            return [{"run_id": row["run_id"], "status": row["status"].upper(),
                      "mode": "model" if json.loads(row["config_json"])["llm_url"] else "local",
                      "created_at": row["created_at"], "updated_at": row["updated_at"]}
                     for row in connection.execute("SELECT * FROM runs ORDER BY created_at DESC,run_id")]

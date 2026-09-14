@@ -37,3 +37,4 @@ jobs:
           opscheck --version
           opscheck flow-demo --fail-once quality_agent
           opscheck runs
+          python "$GITHUB_WORKSPACE/scripts/smoke_installed.py"

@@ -46,9 +46,10 @@ class WorkflowTests(unittest.TestCase):
 
     def test_detected_business_problems_are_a_successful_workflow(self):
         result = self.run_flow()
-        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["status"], "WAITING_FOR_APPROVAL")
         self.assertEqual(result["mode"], "local")
-        self.assertTrue(all(task["status"] == "succeeded" for task in result["tasks"]))
+        self.assertTrue(all(self.tasks(result)[task]["status"] == "succeeded" for task in workflow.PLAN))
+        self.assertEqual(self.tasks(result)["approval_gate"]["status"], "waiting")
         self.assertEqual(result["results"]["quality_agent"]["status"], "fail")
         self.assertEqual(result["results"]["quality_agent"]["summary"]["issues"], 1)
         self.assertEqual(result["results"]["change_agent"]["summary"]["total_changes"], 3)
@@ -58,7 +59,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_transient_failure_retries_and_persists_attempt_evidence(self):
         result = self.run_flow(fail_once="quality_agent", max_attempts=2)
-        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["status"], "WAITING_FOR_APPROVAL")
         self.assertEqual(self.tasks(result)["quality_agent"]["attempts"], 2)
         events = [event["event"] for event in result["events"] if event["task"] == "quality_agent"]
         self.assertEqual(events, ["task_started", "task_failed", "task_retrying", "task_started", "task_succeeded"])
@@ -76,7 +77,7 @@ class WorkflowTests(unittest.TestCase):
     def test_exhausted_failure_preserves_independent_success(self):
         result = self.run_flow(fail_once="quality_agent", max_attempts=1)
         tasks = self.tasks(result)
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status"], "FAILED")
         self.assertEqual(tasks["quality_agent"]["status"], "failed")
         self.assertEqual(tasks["quality_agent"]["attempts"], 1)
         self.assertEqual(tasks["change_agent"]["status"], "succeeded")
@@ -109,7 +110,7 @@ class WorkflowTests(unittest.TestCase):
             result = self.run_flow(max_attempts=3)
         self.assertEqual(failing.call_count, 3)
         self.assertEqual(self.tasks(result)["quality_agent"]["attempts"], 3)
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status"], "FAILED")
         self.assertEqual(self.tasks(result)["change_agent"]["status"], "succeeded")
 
     def test_resume_skips_saved_worker_and_uses_new_attempt_allowance(self):
@@ -119,7 +120,7 @@ class WorkflowTests(unittest.TestCase):
             resumed = self.run_flow(run_id=first["run_id"], max_attempts=2)
         # The one call is the independent verifier: the saved change worker is reused.
         self.assertEqual(compare_calls.call_count, 1)
-        self.assertEqual(resumed["status"], "succeeded")
+        self.assertEqual(resumed["status"], "WAITING_FOR_APPROVAL")
         self.assertEqual(self.tasks(resumed)["quality_agent"]["attempts"], 2)
         self.assertEqual(self.tasks(resumed)["change_agent"]["attempts"], 1)
         reused = [event["task"] for event in resumed["events"] if event["event"] == "task_reused"]
@@ -127,10 +128,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(resumed["results"]["change_agent"], first["results"]["change_agent"])
 
     def test_finished_run_resume_does_not_execute_tasks_again(self):
-        first = self.run_flow()
+        from opscheck.approvals import decide
+        waiting = self.run_flow()
+        first = decide(waiting["run_id"], "approved", state_dir=self.state)
         with patch.object(workflow, "validate", side_effect=AssertionError("completed task must not rerun")):
             resumed = self.run_flow(run_id=first["run_id"])
-        self.assertEqual(resumed["status"], "succeeded")
+        self.assertEqual(resumed["status"], "SUCCEEDED")
         self.assertTrue(all(task["attempts"] == 1 for task in resumed["tasks"]))
         self.assertEqual(resumed["results"], first["results"])
 
@@ -139,7 +142,7 @@ class WorkflowTests(unittest.TestCase):
         self.input.write_text(self.input.read_text(encoding="utf-8").replace("invalid", "new@example.com"), encoding="utf-8")
         with self.assertRaisesRegex(OpsCheckError, "changed"):
             self.run_flow(run_id=first["run_id"])
-        self.assertEqual(workflow.list_runs(self.state)[0]["status"], "succeeded")
+        self.assertEqual(workflow.list_runs(self.state)[0]["status"], "WAITING_FOR_APPROVAL")
 
     def test_changed_processing_configuration_refuses_resume(self):
         first = self.run_flow()
@@ -170,7 +173,7 @@ class WorkflowTests(unittest.TestCase):
         with patch.object(workflow, "validate", side_effect=wrap("quality", original_validate)), \
              patch.object(workflow, "compare", side_effect=wrap("changes", original_compare)):
             result = self.run_flow()
-        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["status"], "WAITING_FOR_APPROVAL")
         self.assertEqual(len(seen), 2)
         self.assertEqual(counts, {"quality": 2, "changes": 2})
 
@@ -178,7 +181,7 @@ class WorkflowTests(unittest.TestCase):
         self.before.write_text("order_id,total\n1,10\n1,20\n", encoding="utf-8")
         result = self.run_flow(max_attempts=5)
         tasks = self.tasks(result)
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status"], "FAILED")
         self.assertEqual(tasks["change_agent"]["attempts"], 1)
         self.assertEqual(tasks["quality_agent"]["status"], "succeeded")
         self.assertFalse(any(event["event"] == "task_retrying" for event in result["events"]))
@@ -197,7 +200,7 @@ class WorkflowTests(unittest.TestCase):
 
         with patch.object(workflow, "validate", side_effect=incorrect_first_result):
             result = self.run_flow(max_attempts=5)
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status"], "FAILED")
         self.assertEqual(self.tasks(result)["verifier"]["attempts"], 1)
         self.assertIn("Verification failed", self.tasks(result)["verifier"]["error"])
         self.assertEqual(self.tasks(result)["briefing_agent"]["status"], "blocked")
@@ -212,7 +215,7 @@ class WorkflowTests(unittest.TestCase):
 
         with patch.object(workflow, "validate", side_effect=mutate_after_read):
             result = self.run_flow()
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status"], "FAILED")
         self.assertIn("changed during", self.tasks(result)["verifier"]["error"])
 
     def test_failed_model_review_history_is_saved_without_automatic_retry(self):
@@ -224,7 +227,7 @@ class WorkflowTests(unittest.TestCase):
         ]
         with patch("opscheck.agents.run_agent_team", side_effect=error) as model_team:
             result = self.run_flow(llm_url="http://127.0.0.1:11434/v1/chat/completions", model="test", max_attempts=5)
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status"], "FAILED")
         self.assertEqual(result["mode"], "model")
         self.assertEqual(model_team.call_count, 1)
         self.assertEqual(self.tasks(result)["briefing_agent"]["attempts"], 1)
@@ -241,7 +244,7 @@ class WorkflowTests(unittest.TestCase):
                     "review_history": [{"round": 1, "approved": True, "feedback": "Supported."}]}
         with patch("opscheck.agents.run_agent_team", side_effect=[TransportError("connection lost"), briefing]) as model_team:
             result = self.run_flow(llm_url="http://127.0.0.1:11434/v1/chat/completions", model="test", max_attempts=2)
-        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["status"], "WAITING_FOR_APPROVAL")
         self.assertEqual(model_team.call_count, 2)
         self.assertEqual(self.tasks(result)["briefing_agent"]["attempts"], 2)
         self.assertEqual(self.tasks(result)["quality_agent"]["attempts"], 1)
@@ -283,7 +286,7 @@ class WorkflowTests(unittest.TestCase):
                 thread.join(10)
         self.assertFalse(thread.is_alive())
         self.assertFalse(failures)
-        self.assertEqual(results[0]["status"], "succeeded")
+        self.assertEqual(results[0]["status"], "WAITING_FOR_APPROVAL")
 
     @unittest.skipUnless(os.name in ("posix", "nt"), "requires supported OS advisory locks")
     def test_process_crash_releases_lock_and_resume_recovers_running_task(self):
@@ -306,9 +309,9 @@ workflow.run_workflow(*sys.argv[1:5], state_dir=sys.argv[5])
                                  env=environment, capture_output=True, text=True, timeout=20)
         self.assertEqual(process.returncode, 23, process.stderr)
         interrupted = workflow.list_runs(self.state)[0]
-        self.assertEqual(interrupted["status"], "running")
+        self.assertEqual(interrupted["status"], "RUNNING")
         resumed = self.run_flow(run_id=interrupted["run_id"])
-        self.assertEqual(resumed["status"], "succeeded")
+        self.assertEqual(resumed["status"], "WAITING_FOR_APPROVAL")
         self.assertGreaterEqual(self.tasks(resumed)["quality_agent"]["attempts"], 2)
         self.assertTrue(any(event["event"] == "task_recovered" and event["task"] == "quality_agent"
                             for event in resumed["events"]))
@@ -369,7 +372,7 @@ workflow.run_workflow(*sys.argv[1:5], state_dir=sys.argv[5])
         failed = self.run_flow(fail_once="change_agent", max_attempts=1)
         history = workflow.list_runs(self.state)
         self.assertEqual([row["run_id"] for row in history], [failed["run_id"], succeeded["run_id"]])
-        self.assertEqual([row["status"] for row in history], ["failed", "succeeded"])
+        self.assertEqual([row["status"] for row in history], ["FAILED", "WAITING_FOR_APPROVAL"])
         self.assertTrue(all(row["mode"] == "local" for row in history))
 
 
