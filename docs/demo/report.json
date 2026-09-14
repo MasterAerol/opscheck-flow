@@ -1,0 +1,564 @@
+{
+  "run_id": "664a7a4cc22f497988b067c40aa2c7b5",
+  "status": "succeeded",
+  "mode": "local",
+  "plan": {
+    "planner": [],
+    "quality_agent": [
+      "planner"
+    ],
+    "change_agent": [
+      "planner"
+    ],
+    "verifier": [
+      "quality_agent",
+      "change_agent"
+    ],
+    "briefing_agent": [
+      "verifier"
+    ]
+  },
+  "tasks": [
+    {
+      "id": "planner",
+      "status": "succeeded",
+      "attempts": 1,
+      "error": null
+    },
+    {
+      "id": "quality_agent",
+      "status": "succeeded",
+      "attempts": 2,
+      "error": null
+    },
+    {
+      "id": "change_agent",
+      "status": "succeeded",
+      "attempts": 1,
+      "error": null
+    },
+    {
+      "id": "verifier",
+      "status": "succeeded",
+      "attempts": 1,
+      "error": null
+    },
+    {
+      "id": "briefing_agent",
+      "status": "succeeded",
+      "attempts": 1,
+      "error": null
+    }
+  ],
+  "events": [
+    {
+      "id": 1,
+      "event": "run_created",
+      "task": null,
+      "timestamp": "2026-09-14T13:41:14.882325+00:00",
+      "mode": "local"
+    },
+    {
+      "id": 2,
+      "event": "task_started",
+      "task": "planner",
+      "timestamp": "2026-09-14T13:41:14.882528+00:00",
+      "attempt": 1
+    },
+    {
+      "id": 3,
+      "event": "task_succeeded",
+      "task": "planner",
+      "timestamp": "2026-09-14T13:41:14.883003+00:00",
+      "attempt": 1
+    },
+    {
+      "id": 4,
+      "event": "task_started",
+      "task": "quality_agent",
+      "timestamp": "2026-09-14T13:41:14.883103+00:00",
+      "attempt": 1
+    },
+    {
+      "id": 5,
+      "event": "task_started",
+      "task": "change_agent",
+      "timestamp": "2026-09-14T13:41:14.883207+00:00",
+      "attempt": 1
+    },
+    {
+      "id": 6,
+      "event": "task_failed",
+      "task": "quality_agent",
+      "timestamp": "2026-09-14T13:41:14.883520+00:00",
+      "attempt": 1,
+      "error": "TransientTaskError: Injected transient failure in quality_agent; retry is safe.",
+      "retryable": true
+    },
+    {
+      "id": 7,
+      "event": "task_retrying",
+      "task": "quality_agent",
+      "timestamp": "2026-09-14T13:41:14.883967+00:00",
+      "next_attempt": 2
+    },
+    {
+      "id": 8,
+      "event": "task_started",
+      "task": "quality_agent",
+      "timestamp": "2026-09-14T13:41:14.884103+00:00",
+      "attempt": 2
+    },
+    {
+      "id": 9,
+      "event": "task_succeeded",
+      "task": "change_agent",
+      "timestamp": "2026-09-14T13:41:14.884273+00:00",
+      "attempt": 1
+    },
+    {
+      "id": 10,
+      "event": "task_succeeded",
+      "task": "quality_agent",
+      "timestamp": "2026-09-14T13:41:14.884768+00:00",
+      "attempt": 2
+    },
+    {
+      "id": 11,
+      "event": "task_started",
+      "task": "verifier",
+      "timestamp": "2026-09-14T13:41:14.884852+00:00",
+      "attempt": 1
+    },
+    {
+      "id": 12,
+      "event": "task_succeeded",
+      "task": "verifier",
+      "timestamp": "2026-09-14T13:41:14.885668+00:00",
+      "attempt": 1
+    },
+    {
+      "id": 13,
+      "event": "task_started",
+      "task": "briefing_agent",
+      "timestamp": "2026-09-14T13:41:14.885764+00:00",
+      "attempt": 1
+    },
+    {
+      "id": 14,
+      "event": "task_succeeded",
+      "task": "briefing_agent",
+      "timestamp": "2026-09-14T13:41:14.900647+00:00",
+      "attempt": 1
+    },
+    {
+      "id": 15,
+      "event": "run_completed",
+      "task": null,
+      "timestamp": "2026-09-14T13:41:14.900804+00:00",
+      "status": "succeeded"
+    }
+  ],
+  "results": {
+    "quality_agent": {
+      "findings": [
+        {
+          "code": "duplicate",
+          "column": "order_id",
+          "message": "Duplicate value; first seen at record 3.",
+          "row": 4,
+          "value": "ORD-1002"
+        },
+        {
+          "code": "required",
+          "column": "email",
+          "message": "A nonblank value is required.",
+          "row": 5,
+          "value": ""
+        },
+        {
+          "code": "type",
+          "column": "email",
+          "message": "Expected a valid email value.",
+          "row": 6,
+          "value": "buyer05example.com"
+        },
+        {
+          "code": "min",
+          "column": "total",
+          "message": "Value must be at least 0.",
+          "row": 7,
+          "value": "-120"
+        },
+        {
+          "code": "allowed",
+          "column": "status",
+          "message": "Value is not in the configured allowed list.",
+          "row": 8,
+          "value": "shipped"
+        },
+        {
+          "code": "type",
+          "column": "order_date",
+          "message": "Expected a valid date value.",
+          "row": 9,
+          "value": "2026-02-30"
+        },
+        {
+          "code": "required",
+          "column": "order_id",
+          "message": "A nonblank value is required.",
+          "row": 10,
+          "value": ""
+        },
+        {
+          "code": "type",
+          "column": "total",
+          "message": "Expected a valid number value.",
+          "row": 11,
+          "value": "1,200"
+        }
+      ],
+      "kind": "validate",
+      "source": "orders-messy.csv",
+      "status": "fail",
+      "summary": {
+        "affected_rows": 8,
+        "issues": 8,
+        "reported_findings": 8,
+        "rows": 10
+      },
+      "version": 1
+    },
+    "change_agent": {
+      "findings": [
+        {
+          "after": {
+            "customer": "Bruno",
+            "email": "buyer02@example.com",
+            "order_date": "2026-09-02",
+            "order_id": "ORD-1002",
+            "status": "paid",
+            "total": "850"
+          },
+          "before": {
+            "customer": "Bruno",
+            "email": "buyer02@example.com",
+            "order_date": "2026-09-02",
+            "order_id": "ORD-1002",
+            "status": "pending",
+            "total": "850"
+          },
+          "fields": [
+            "status"
+          ],
+          "key": "ORD-1002",
+          "kind": "changed"
+        },
+        {
+          "after": null,
+          "before": {
+            "customer": "Carla",
+            "email": "buyer03@example.com",
+            "order_date": "2026-09-02",
+            "order_id": "ORD-1003",
+            "status": "paid",
+            "total": "450"
+          },
+          "fields": [
+            "customer",
+            "email",
+            "order_date",
+            "status",
+            "total"
+          ],
+          "key": "ORD-1003",
+          "kind": "removed"
+        },
+        {
+          "after": {
+            "customer": "Finn",
+            "email": "buyer06@example.com",
+            "order_date": "2026-09-03",
+            "order_id": "ORD-1006",
+            "status": "paid",
+            "total": "150"
+          },
+          "before": {
+            "customer": "Finn",
+            "email": "buyer06@example.com",
+            "order_date": "2026-09-03",
+            "order_id": "ORD-1006",
+            "status": "pending",
+            "total": "120"
+          },
+          "fields": [
+            "status",
+            "total"
+          ],
+          "key": "ORD-1006",
+          "kind": "changed"
+        },
+        {
+          "after": {
+            "customer": "Kai",
+            "email": "buyer11@example.com",
+            "order_date": "2026-09-05",
+            "order_id": "ORD-1011",
+            "status": "pending",
+            "total": "375"
+          },
+          "before": null,
+          "fields": [
+            "customer",
+            "email",
+            "order_date",
+            "status",
+            "total"
+          ],
+          "key": "ORD-1011",
+          "kind": "added"
+        }
+      ],
+      "key": "order_id",
+      "kind": "compare",
+      "schema": {
+        "added": [],
+        "removed": []
+      },
+      "source": "orders-before.csv → orders-after.csv",
+      "status": "changed",
+      "summary": {
+        "added": 1,
+        "after_rows": 10,
+        "before_rows": 10,
+        "changed": 2,
+        "removed": 1,
+        "reported_findings": 4,
+        "total_changes": 4,
+        "unchanged": 7
+      },
+      "version": 1
+    },
+    "briefing_agent": {
+      "approved": true,
+      "briefing": {
+        "actions": [
+          {
+            "evidence_ids": [
+              "V1",
+              "V2",
+              "V3",
+              "V4",
+              "V5"
+            ],
+            "priority": "high",
+            "title": "Review the validation findings before importing this export."
+          },
+          {
+            "evidence_ids": [
+              "C1",
+              "C2",
+              "C3",
+              "C4"
+            ],
+            "priority": "medium",
+            "title": "Review the snapshot changes against the expected business updates."
+          }
+        ],
+        "summary": "Quality check: 8 issues across 8 of 10 records. Snapshot comparison: 1 added, 1 removed, 2 changed, and 7 unchanged records. Schema: 0 added and 0 removed columns. Totals include findings omitted from the detailed samples."
+      },
+      "evidence": {
+        "change_summary": {
+          "added": 1,
+          "after_rows": 10,
+          "before_rows": 10,
+          "changed": 2,
+          "removed": 1,
+          "reported_findings": 4,
+          "total_changes": 4,
+          "unchanged": 7
+        },
+        "evidence": [
+          {
+            "code": "duplicate",
+            "column": "order_id",
+            "id": "V1",
+            "message": "Duplicate value; first seen at record 3.",
+            "row": 4,
+            "value": "ORD-1002"
+          },
+          {
+            "code": "required",
+            "column": "email",
+            "id": "V2",
+            "message": "A nonblank value is required.",
+            "row": 5,
+            "value": ""
+          },
+          {
+            "code": "type",
+            "column": "email",
+            "id": "V3",
+            "message": "Expected a valid email value.",
+            "row": 6,
+            "value": "buyer05example.com"
+          },
+          {
+            "code": "min",
+            "column": "total",
+            "id": "V4",
+            "message": "Value must be at least 0.",
+            "row": 7,
+            "value": "-120"
+          },
+          {
+            "code": "allowed",
+            "column": "status",
+            "id": "V5",
+            "message": "Value is not in the configured allowed list.",
+            "row": 8,
+            "value": "shipped"
+          },
+          {
+            "code": "type",
+            "column": "order_date",
+            "id": "V6",
+            "message": "Expected a valid date value.",
+            "row": 9,
+            "value": "2026-02-30"
+          },
+          {
+            "code": "required",
+            "column": "order_id",
+            "id": "V7",
+            "message": "A nonblank value is required.",
+            "row": 10,
+            "value": ""
+          },
+          {
+            "code": "type",
+            "column": "total",
+            "id": "V8",
+            "message": "Expected a valid number value.",
+            "row": 11,
+            "value": "1,200"
+          },
+          {
+            "after": {
+              "customer": "Bruno",
+              "email": "buyer02@example.com",
+              "order_date": "2026-09-02",
+              "order_id": "ORD-1002",
+              "status": "paid",
+              "total": "850"
+            },
+            "before": {
+              "customer": "Bruno",
+              "email": "buyer02@example.com",
+              "order_date": "2026-09-02",
+              "order_id": "ORD-1002",
+              "status": "pending",
+              "total": "850"
+            },
+            "fields": [
+              "status"
+            ],
+            "id": "C1",
+            "key": "ORD-1002",
+            "kind": "changed"
+          },
+          {
+            "after": null,
+            "before": {
+              "customer": "Carla",
+              "email": "buyer03@example.com",
+              "order_date": "2026-09-02",
+              "order_id": "ORD-1003",
+              "status": "paid",
+              "total": "450"
+            },
+            "fields": [
+              "customer",
+              "email",
+              "order_date",
+              "status",
+              "total"
+            ],
+            "id": "C2",
+            "key": "ORD-1003",
+            "kind": "removed"
+          },
+          {
+            "after": {
+              "customer": "Finn",
+              "email": "buyer06@example.com",
+              "order_date": "2026-09-03",
+              "order_id": "ORD-1006",
+              "status": "paid",
+              "total": "150"
+            },
+            "before": {
+              "customer": "Finn",
+              "email": "buyer06@example.com",
+              "order_date": "2026-09-03",
+              "order_id": "ORD-1006",
+              "status": "pending",
+              "total": "120"
+            },
+            "fields": [
+              "status",
+              "total"
+            ],
+            "id": "C3",
+            "key": "ORD-1006",
+            "kind": "changed"
+          },
+          {
+            "after": {
+              "customer": "Kai",
+              "email": "buyer11@example.com",
+              "order_date": "2026-09-05",
+              "order_id": "ORD-1011",
+              "status": "pending",
+              "total": "375"
+            },
+            "before": null,
+            "fields": [
+              "customer",
+              "email",
+              "order_date",
+              "status",
+              "total"
+            ],
+            "id": "C4",
+            "key": "ORD-1011",
+            "kind": "added"
+          }
+        ],
+        "quality_summary": {
+          "affected_rows": 8,
+          "issues": 8,
+          "reported_findings": 8,
+          "rows": 10
+        },
+        "truncation": {
+          "applied": false,
+          "change_available_findings": 4,
+          "change_included_findings": 4,
+          "max_collection_items": 20,
+          "max_evidence_bytes": 65536,
+          "max_findings_per_source": 20,
+          "max_string_characters": 500,
+          "quality_available_findings": 8,
+          "quality_included_findings": 8,
+          "schema_evidence_included": false
+        }
+      },
+      "mode": "local",
+      "review_history": [],
+      "rounds": 0
+    }
+  },
+  "state_dir": "/workspace/scratch/ed7f633a6877/installed-check/.opscheck/runs"
+}

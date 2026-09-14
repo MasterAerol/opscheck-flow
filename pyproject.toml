@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opscheck"
+version = "0.1.0"
+description = "Persistent workflows, parallel data agents, bounded retries, and verified CSV reports"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "OpsCheck contributors"}]
+keywords = ["workflow", "agents", "csv", "data-quality", "automation", "cli"]
+dependencies = []
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+  "Topic :: Utilities",
+]
+
+[project.scripts]
+opscheck = "opscheck.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["opscheck*"]
+
+[tool.setuptools.package-data]
+opscheck = ["examples/*.csv", "examples/*.json"]

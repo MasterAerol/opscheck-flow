@@ -1,0 +1,42 @@
+name: Bug report
+description: Report an incorrect result or workflow failure using synthetic data.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use a small synthetic example. Do not include real exports, credentials, or private run state.
+        For security-sensitive reports, follow SECURITY.md.
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OpsCheck version, Python version, and operating system.
+      placeholder: OpsCheck 0.1.0, Python 3.12, Windows 11
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Exact command and the smallest synthetic CSV/rules example that shows the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+      description: Relevant output or exception. Redact private paths and source values.
+    validations:
+      required: true
+  - type: textarea
+    id: recovery
+    attributes:
+      label: Recovery context
+      description: If relevant, describe retries, whether this was a resumed run, and whether inputs changed.
