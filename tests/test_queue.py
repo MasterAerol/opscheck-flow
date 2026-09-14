@@ -391,9 +391,12 @@ class QueueTests(unittest.TestCase):
         self.assertTrue(all(t["attempts"] == 1 for t in recovered["tasks"] if t["id"] in workflow.PLAN))
 
     def test_inspection_recovers_checkpoint_and_success_before_queue_commit(self):
+        self.clock()
         job = self.enqueue()
         claim = self.claim()
         worker._execute(claim, self.state)
+        self.assertEqual(self.inspect(job)["status"], "LEASED")
+        self.now = datetime.fromisoformat(claim["lease_expires_at"]).timestamp()
         self.assertEqual(self.inspect(job)["status"], "WAITING_FOR_APPROVAL")
         with patch.object(approvals, "_publish_result", side_effect=RuntimeError("crash before publish")):
             with self.assertRaises(RuntimeError):
@@ -401,6 +404,138 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(self.inspect(job)["status"], "SUCCEEDED")
         self.assertEqual(ingestion.inspect_event(job["ingestion_id"], self.state)["status"], "COMPLETED")
         self.assertEqual(len(approvals.inspect_run(job["workflow_run_id"], self.state)["approvals"]), 1)
+
+    def checkpoint_claim(self):
+        self.clock()
+        self.enqueue(max_attempts=1)
+        claim = self.claim()
+        self.assertEqual(worker._execute(claim, self.state)["status"], "WAITING_FOR_APPROVAL")
+        return claim
+
+    def assert_owner_can_finish(self, claim, expected="WAITING_FOR_APPROVAL"):
+        with closing(workflow._connect(self.state / "runs.sqlite3")) as connection:
+            saved = store.get(connection, claim["id"], private=True)
+        self.assert_identity(claim, saved)
+        for key in ("status", "lease_token", "lease_owner", "lease_expires_at", "attempts"):
+            self.assertEqual(saved[key], claim[key], key)
+        self.assertEqual(saved["attempt_history"][0]["outcome"], "RUNNING")
+        self.assertFalse(saved["attempt_history"][0]["lease_lost"])
+        finished = queue.finish(claim["id"], claim["lease_token"], self.state)
+        self.assertEqual(finished["status"], expected)
+        self.assertEqual(finished["attempt_history"][0]["outcome"], expected)
+        self.assertFalse(finished["attempt_history"][0]["lease_lost"])
+        self.assertNotIn("lease_lost", [e["event"] for e in finished["history"]])
+        self.assertEqual(len(workflow.list_runs(self.state)), 1)
+
+    def test_active_lease_survives_inspect_before_owner_finish(self):
+        claim = self.checkpoint_claim()
+        self.assertEqual(self.inspect(claim)["status"], "LEASED")
+        self.assert_owner_can_finish(claim)
+
+    def test_active_lease_survives_list_before_owner_finish(self):
+        claim = self.checkpoint_claim()
+        self.assertEqual(queue.list_jobs(self.state)[0]["status"], "LEASED")
+        self.assert_owner_can_finish(claim)
+
+    def test_active_lease_survives_competing_claim_before_owner_finish(self):
+        claim = self.checkpoint_claim()
+        self.assertIsNone(self.claim("worker-b"))
+        self.assert_owner_can_finish(claim)
+
+    def test_active_lease_survives_successful_workflow_observers(self):
+        claim = self.checkpoint_claim()
+        approvals.decide(claim["workflow_run_id"], "approved", "Aerol", state_dir=self.state)
+        self.assertEqual(ingestion.inspect_event(claim["ingestion_id"], self.state)["status"], "COMPLETED")
+        self.assertEqual(approvals.inspect_run(claim["workflow_run_id"], self.state)["status"], "SUCCEEDED")
+        self.assertEqual(self.inspect(claim)["status"], "LEASED")
+        self.assertEqual(queue.list_jobs(self.state)[0]["status"], "LEASED")
+        self.assertIsNone(self.claim("worker-b"))
+        self.assert_owner_can_finish(claim, "SUCCEEDED")
+
+    def test_active_lease_survives_replay_of_another_job(self):
+        dead = self.enqueue(max_attempts=1)
+        self.assertEqual(self.work(fail_job=True)["status"], "DEAD_LETTER")
+        rules = self.inbox / "data/rules.json"
+        rules.write_bytes(rules.read_bytes() + b"\n")  # Distinct, valid canonical content.
+        claim = self.checkpoint_claim()
+        replayed = queue.replay(dead["id"], self.state)
+        self.assertEqual(replayed["status"], "QUEUED")
+        self.assertEqual(ingestion.inspect_event(claim["ingestion_id"], self.state)["status"], "WAITING_FOR_APPROVAL")
+        self.assertEqual(approvals.inspect_run(claim["workflow_run_id"], self.state)["status"], "WAITING_FOR_APPROVAL")
+        self.assert_owner_can_finish(claim)
+
+    def expired_checkpoint_recovery(self, status):
+        self.clock()
+        for observer in ("inspect", "list", "claim"):
+            with self.subTest(observer=observer):
+                self.state = self.root / observer
+                job = self.enqueue(max_attempts=1)
+                claim = self.claim()
+                worker._execute(claim, self.state)
+                if status == "SUCCEEDED":
+                    approvals.decide(job["workflow_run_id"], "approved", "Aerol", state_dir=self.state)
+                before = approvals.inspect_run(job["workflow_run_id"], self.state)
+                self.now = datetime.fromisoformat(claim["lease_expires_at"]).timestamp()
+                if observer == "claim":
+                    self.assertIsNone(self.claim("worker-b"))
+                elif observer == "list":
+                    self.assertEqual(queue.list_jobs(self.state)[0]["status"], status)
+                recovered = self.inspect(job)
+                self.assert_identity(job, recovered)
+                self.assertEqual(recovered["status"], status)
+                self.assertEqual(recovered["attempts"], 1)
+                self.assertIsNone(recovered["last_error"])
+                self.assertIsNone(recovered["lease_owner"])
+                attempt = recovered["attempt_history"][0]
+                self.assertEqual(attempt["outcome"], status)
+                self.assertFalse(attempt["lease_lost"])
+                self.assertIsNone(attempt["error"])
+                names = [e["event"] for e in recovered["history"]]
+                self.assertTrue(set(names).isdisjoint({"lease_expired", "job_failed", "job_requeued", "job_dead_lettered", "lease_lost"}))
+                after = approvals.inspect_run(job["workflow_run_id"], self.state)
+                self.assertEqual(before["tasks"], after["tasks"])
+                self.assertEqual(before["approvals"], after["approvals"])
+                self.assertEqual(len(workflow.list_runs(self.state)), 1)
+                self.assertEqual(len(ingestion.list_events(self.state)), 1)
+                # Repeated inspection must not duplicate settlement or alter audit.
+                self.assertEqual(self.inspect(job), recovered)
+
+    def test_expired_waiting_checkpoint_recovers_without_delivery_failure(self):
+        self.expired_checkpoint_recovery("WAITING_FOR_APPROVAL")
+
+    def test_expired_succeeded_checkpoint_recovers_without_requeue(self):
+        self.expired_checkpoint_recovery("SUCCEEDED")
+
+    def test_checkpoint_expiring_during_claim_is_not_misclassified_as_failure(self):
+        claim = self.checkpoint_claim()
+        expiry = datetime.fromisoformat(claim["lease_expires_at"]).timestamp()
+        readings = iter([expiry - .001])
+        with patch.object(store, "clock", side_effect=lambda: next(readings, expiry + .001)):
+            self.assertIsNone(self.claim("worker-b"))
+        self.now = expiry + .001
+        self.assertIsNone(self.claim("worker-b"))
+        saved = self.inspect(claim)
+        self.assertEqual(saved["status"], "WAITING_FOR_APPROVAL")
+        self.assertEqual(saved["attempt_history"][0]["outcome"], "WAITING_FOR_APPROVAL")
+        self.assertFalse(saved["attempt_history"][0]["lease_lost"])
+        self.assertNotIn("job_dead_lettered", [e["event"] for e in saved["history"]])
+
+    def test_expired_incomplete_workflow_records_expiry_and_reuses_run(self):
+        self.clock()
+        job = self.enqueue()
+        claim = self.claim()
+        with patch.object(workflow, "_run_tasks", side_effect=RuntimeError("interrupted before checkpoint")):
+            with self.assertRaises(RuntimeError):
+                worker._execute(claim, self.state)
+        self.now = datetime.fromisoformat(claim["lease_expires_at"]).timestamp()
+        reclaimed = self.claim("worker-b")
+        self.assert_identity(job, reclaimed)
+        self.assertEqual(reclaimed["attempts"], 2)
+        self.assertEqual(reclaimed["attempt_history"][0]["outcome"], "EXPIRED")
+        self.assertTrue(reclaimed["attempt_history"][0]["lease_lost"])
+        self.assertIn("lease_expired", [e["event"] for e in reclaimed["history"]])
+        self.assertEqual(worker.process(reclaimed, self.state)["status"], "WAITING_FOR_APPROVAL")
+        self.assertEqual(len(workflow.list_runs(self.state)), 1)
 
     def test_heartbeat_thread_renews_and_closes_without_audit_spam(self):
         self.clock()
@@ -658,6 +793,49 @@ print(json.dumps(worker.process(job, sys.argv[1])))
         self.assertEqual([p.returncode for p in children], [0, 0], results)
         self.assertEqual(len(workflow.list_runs(self.state)), 2)
 
+    def test_real_observer_process_cannot_revoke_owner_paused_before_finish(self):
+        self.clock()
+        job = self.enqueue(max_attempts=1)
+        script = '''
+import json, sys
+from opscheck import queue, queue_store, worker
+queue_store.clock = lambda: float(sys.argv[2])
+finish = queue.finish
+def pause_before_finish(*args, **kwargs):
+    print("checkpoint committed", flush=True)
+    sys.stdin.readline()
+    return finish(*args, **kwargs)
+queue.finish = pause_before_finish
+raise SystemExit(worker.run(sys.argv[1], once=True, worker_id="worker-a", emit=lambda result: print(json.dumps(result))))
+'''
+        child = self.subprocesses(script, 1, self.now)[0]
+        self.assertEqual(child.stdout.readline().strip(), "checkpoint committed")
+        observer = '''
+import json, sys
+from opscheck import queue, queue_store
+queue_store.clock = lambda: float(sys.argv[3])
+inspected = queue.inspect_job(sys.argv[2], sys.argv[1])
+listed = queue.list_jobs(sys.argv[1])
+claimed = queue.claim(sys.argv[1], worker_id="worker-b")
+print(json.dumps({"inspect": inspected["status"], "list": listed[0]["status"],
+                  "owner": inspected["lease_owner"], "claim": claimed}))
+'''
+        observed = subprocess.run([sys.executable, "-c", observer, str(self.state), job["id"], str(self.now)],
+                                  cwd=ROOT, capture_output=True, text=True, timeout=30)
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        self.assertEqual(json.loads(observed.stdout), {"inspect": "LEASED", "list": "LEASED", "owner": "worker-a", "claim": None})
+        output, error = child.communicate("finish\n", timeout=30)
+        self.assertEqual(child.returncode, 0, error)
+        finished = json.loads(output)
+        self.assertEqual(finished["status"], "WAITING_FOR_APPROVAL")
+        self.assertIsNone(finished["processing_error"])
+        self.assertEqual(finished["attempts"], 1)
+        self.assertEqual(finished["attempt_history"][0]["outcome"], "WAITING_FOR_APPROVAL")
+        self.assertFalse(finished["attempt_history"][0]["lease_lost"])
+        self.assertEqual(len(queue.list_jobs(self.state)), 1)
+        self.assertEqual(len(ingestion.list_events(self.state)), 1)
+        self.assertEqual(len(workflow.list_runs(self.state)), 1)
+
     def test_real_worker_crashes_at_all_durable_boundaries(self):
         script = '''
 import os, sys
@@ -693,6 +871,15 @@ if boundary == "success":
                     with patch.object(store, "clock", return_value=future):
                         recovered = self.work()
                     self.assert_identity(job, recovered)
+                elif boundary == "waiting":
+                    # Process death does not itself revoke an unexpired lease.
+                    saved = self.inspect(job)
+                    self.assertEqual(saved["status"], "LEASED")
+                    future = datetime.fromisoformat(saved["lease_expires_at"]).timestamp() + 1
+                    with patch.object(store, "clock", return_value=future):
+                        recovered = self.inspect(job)
+                    self.assertEqual(recovered["attempt_history"][0]["outcome"], "WAITING_FOR_APPROVAL")
+                    self.assertFalse(recovered["attempt_history"][0]["lease_lost"])
                 final = self.inspect(job)
                 self.assertEqual(final["status"], "SUCCEEDED" if boundary == "success" else "WAITING_FOR_APPROVAL")
                 self.assertEqual(len(workflow.list_runs(self.state)), 1)

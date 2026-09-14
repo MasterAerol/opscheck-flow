@@ -87,7 +87,7 @@ def inspect_job(job_id: str, state_dir=DEFAULT_STATE) -> dict:
         connection.execute("BEGIN IMMEDIATE")
         with connection:
             event_store.synchronize(connection)
-            store.synchronize(connection, include_leased=True)
+            store.synchronize(connection, expired_before=store.stamp())
             job = store.get(connection, job_id)
             if job is None:
                 raise OpsCheckError("Queue job not found.")
@@ -102,7 +102,7 @@ def list_jobs(state_dir=DEFAULT_STATE, *, deadletters: bool = False) -> list[dic
         connection.execute("BEGIN IMMEDIATE")
         with connection:
             event_store.synchronize(connection)
-            store.synchronize(connection, include_leased=True)
+            store.synchronize(connection, expired_before=store.stamp())
             query = "SELECT id FROM queue_jobs" + (" WHERE status='DEAD_LETTER'" if deadletters else "")
             return [store.get(connection, r[0]) for r in connection.execute(query + " ORDER BY created_at,id")]
 
@@ -116,10 +116,12 @@ def claim(state_dir=DEFAULT_STATE, *, worker_id: str, lease_seconds: float = 30)
     with ingestion._database(directory, create=False) as (connection, _):
         connection.execute("BEGIN IMMEDIATE")
         with connection:
-            event_store.synchronize(connection)
-            store.synchronize(connection, include_leased=True)
             now = store.clock()
             timestamp = store.stamp(now)
+            event_store.synchronize(connection)
+            # Reconcile successful checkpoints before charging expired deliveries,
+            # using one cutoff even if a lease expires while this transaction runs.
+            store.synchronize(connection, expired_before=timestamp)
             expired = connection.execute("SELECT * FROM queue_jobs WHERE status='LEASED' AND lease_expires_at<=?", (timestamp,)).fetchall()
             for job in expired:
                 store.failure(connection, job, "Worker lease expired.", "LeaseExpired", expired=True)
@@ -206,7 +208,7 @@ def replay(job_id: str, state_dir=DEFAULT_STATE, *, max_attempts: int | None = N
         connection.execute("BEGIN IMMEDIATE")
         with connection:
             event_store.synchronize(connection)
-            store.synchronize(connection, include_leased=True)
+            store.synchronize(connection, expired_before=store.stamp())
             job = store.get(connection, job_id)
             if job is None:
                 raise OpsCheckError("Queue job not found.")

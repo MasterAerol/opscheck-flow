@@ -148,13 +148,14 @@ def failure(connection, job, error: str, error_type: str, *, terminal: bool = Fa
         delay_seconds=delay, replayable=not terminal)
 
 
-def synchronize(connection, run_id: str | None = None, *, include_leased: bool = False) -> None:
+def synchronize(connection, run_id: str | None = None, *, expired_before: str | None = None) -> None:
     """Workflow facts override delivery state; no worker token is accepted here.
 
-    Publishing skips active leases so only the owning worker settles delivery.
-    Inspection may recover a checkpoint committed before a worker died. This is
-    independent reconciliation from authoritative workflow facts, never a stale
-    worker's claimed result. Human decisions on released jobs synchronize directly.
+    Publishing skips leases; observers may recover only leases expired at their
+    captured UTC cutoff. Unexpired ownership remains exclusive even after a saved
+    workflow checkpoint. Claiming uses the same cutoff for this reconciliation
+    and expiry failure handling, so a checkpoint cannot fall between the two.
+    Human decisions on released jobs synchronize directly.
     """
     if not connection.in_transaction:
         connection.execute("BEGIN IMMEDIATE")
@@ -165,7 +166,7 @@ def synchronize(connection, run_id: str | None = None, *, include_leased: bool =
         query += " WHERE r.run_id=?"
         params = (run_id,)
     for job in connection.execute(query, params).fetchall():
-        if job["status"] == "LEASED" and not include_leased:
+        if job["status"] == "LEASED" and (expired_before is None or job["lease_expires_at"] > expired_before):
             continue
         if job["run_status"] in ("WAITING_FOR_APPROVAL", "SUCCEEDED"):
             if job["status"] != job["run_status"]:
