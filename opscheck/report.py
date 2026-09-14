@@ -243,6 +243,17 @@ def _ingestion_html(result: dict) -> str:
     return content + '</section>'
 
 
+def _queue_html(result: dict) -> str:
+    job = result.get('queue')
+    if not job:
+        return ''
+    content = '<section><h2>Queue delivery</h2>'
+    for key, label in (('id', 'Job'), ('status', 'Status'), ('attempts', 'Delivery attempts'),
+                       ('replay_count', 'Replays'), ('last_error', 'Last delivery error')):
+        content += f'<p class="source">{label}: {_s(job.get(key) if job.get(key) is not None else "None")}</p>'
+    return content + '</section>'
+
+
 def render_workflow_html(result: dict) -> str:
     """Render execution evidence separately from underlying business findings."""
     status = str(result.get('status', 'unknown')).lower()
@@ -274,6 +285,7 @@ def render_workflow_html(result: dict) -> str:
     content += _revision_html(results.get('briefing_agent', {}))
     content += _approval_html(result)
     content += _ingestion_html(result)
+    content += _queue_html(result)
     content += '</div></section><section><div class="section-heading"><h2>Check results</h2><span class="muted">Source-level evidence</span></div><div class="panel panel-pad">'
     if quality:
         content += f'<h3>Data quality {_badge(quality.get("status", "unknown"))}</h3><p class="muted">{_s(q.get("rows", 0))} records checked · {_s(q.get("issues", 0))} issues · {_s(q.get("affected_rows", 0))} affected records</p>'

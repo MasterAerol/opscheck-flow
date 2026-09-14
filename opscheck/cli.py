@@ -76,9 +76,35 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("manifest", type=Path)
         elif name == "scan":
             command.add_argument("inbox", type=Path)
+            command.add_argument("--enqueue", action="store_true", help="queue jobs without executing workflows")
+            command.add_argument("--max-attempts", type=int, default=3)
+            command.add_argument("--priority", type=int, default=0)
         elif name in ("event", "retry-event"):
             command.add_argument("event_id")
         event_commands.append(command)
+    queue_commands = []
+    for name in ("enqueue", "worker", "queue", "job", "deadletters", "replay"):
+        command = commands.add_parser(name, help={
+            "enqueue": "queue a manifest without running specialists", "worker": "process durable local queue jobs",
+            "queue": "list queue jobs", "job": "inspect a queue job and attempts", "deadletters": "list dead-letter jobs",
+            "replay": "requeue a replayable dead-letter job with a fresh delivery budget"}[name])
+        if name == "enqueue":
+            command.add_argument("manifest", type=Path)
+            command.add_argument("--priority", type=int, default=0)
+            command.add_argument("--max-attempts", type=int, default=3)
+        if name in ("job", "replay"):
+            command.add_argument("job_id")
+        if name == "replay":
+            command.add_argument("--max-attempts", type=int)
+        if name == "worker":
+            command.add_argument("--once", action="store_true")
+            command.add_argument("--worker-id")
+            command.add_argument("--poll-interval", type=float, default=2)
+            command.add_argument("--lease-seconds", type=float, default=30)
+            command.add_argument("--max-jobs", type=int)
+            command.add_argument("--fail-job", action="store_true", help="demo only: fail every claimed delivery before workflow execution")
+            command.add_argument("--fail-job-once", action="store_true", help="demo only: fail the first delivery in the initial budget")
+        queue_commands.append(command)
     approval_commands = []
     for name in ("approve", "reject", "approvals", "run", "resume"):
         command = commands.add_parser(name, help={
@@ -95,7 +121,7 @@ def _parser() -> argparse.ArgumentParser:
         if name == "resume":
             command.add_argument("--max-attempts", type=int, default=2)
         approval_commands.append(command)
-    for command in (flow, flow_demo, runs, *approval_commands, *event_commands):
+    for command in (flow, flow_demo, runs, *approval_commands, *event_commands, *queue_commands):
         command.add_argument("--state-dir", type=Path, default=Path(".opscheck/runs"))
     for command in (flow, flow_demo):
         command.add_argument("--max-human-revisions", type=int, default=3,
@@ -255,6 +281,14 @@ def _event_command(args: argparse.Namespace) -> int:
                   ("id", "event_id", "status", "workflow_run_id", "duplicate_count", "error")}, ensure_ascii=True))
         return 0
     if args.command == "scan":
+        if args.enqueue:
+            from .queue import scan as queue_scan
+            result = queue_scan(args.inbox, args.state_dir, max_attempts=args.max_attempts, priority=args.priority)
+            for job in result["jobs"]:
+                print(json.dumps({key: job.get(key) for key in ("id", "status", "ingestion_id", "workflow_run_id", "error")}, ensure_ascii=True))
+            for key in ("scanned", "new_queue_jobs", "existing_jobs", "failed"):
+                print(f"{key.replace('_', ' ').capitalize()}: {result[key]}")
+            return 2 if result["failed"] else 0
         result = scan(args.inbox, args.state_dir)
         for event in result["events"]:
             print(json.dumps({key: event.get(key) for key in ("id", "manifest_path", "status", "workflow_run_id", "error", "processing_error")}, ensure_ascii=True))
@@ -271,9 +305,36 @@ def _event_command(args: argparse.Namespace) -> int:
     return 2 if args.command != "event" and (event["status"] in ("INVALID", "FAILED") or event.get("processing_error")) else 0
 
 
+def _queue_command(args) -> int:
+    from . import queue, worker
+    if args.command == "worker":
+        try:
+            return worker.run(args.state_dir, once=args.once, worker_id=args.worker_id, poll_interval=args.poll_interval,
+                              lease_seconds=args.lease_seconds, max_jobs=args.max_jobs, fail_job=args.fail_job,
+                              fail_job_once=args.fail_job_once, emit=lambda job: print(json.dumps(job, ensure_ascii=True)))
+        except KeyboardInterrupt:
+            print("Worker stopped.")
+            return 0
+    if args.command in ("queue", "deadletters"):
+        for job in queue.list_jobs(args.state_dir, deadletters=args.command == "deadletters"):
+            print(json.dumps({key: job[key] for key in ("id", "status", "attempts", "budget_attempts", "max_attempts",
+                  "ingestion_id", "workflow_run_id", "available_at", "lease_owner")}, ensure_ascii=True))
+        return 0
+    if args.command == "enqueue":
+        job = queue.enqueue(args.manifest, args.state_dir, max_attempts=args.max_attempts, priority=args.priority)
+    elif args.command == "replay":
+        job = queue.replay(args.job_id, args.state_dir, max_attempts=args.max_attempts)
+    else:
+        job = queue.inspect_job(args.job_id, args.state_dir)
+    print(json.dumps(job, ensure_ascii=True, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.command in ("enqueue", "worker", "queue", "job", "deadletters", "replay"):
+            return _queue_command(args)
         if args.command in ("ingest", "scan", "events", "event", "retry-event"):
             return _event_command(args)
         if args.command == "demo":

@@ -175,7 +175,7 @@ flowchart TD
     R --> C
 ```
 
-The ingestion loop receives, validates, fingerprints, persists, claims, executes, and inspects the outcome. Each transition has durable evidence. Waiting for human approval stops processing normally; invalid jobs stop with diagnostics; duplicates reuse canonical state; failed jobs require an explicit retry. A one-shot scan repeats this loop for each eligible manifest and isolates individual failures. No watch loop or permanent daemon is introduced.
+The synchronous ingestion loop receives, validates, fingerprints, persists, claims, executes, and inspects the outcome. Each transition has durable evidence. Waiting for human approval stops processing normally; invalid jobs stop with diagnostics; duplicates reuse canonical state; failed jobs require an explicit retry. A one-shot scan repeats this loop for each eligible manifest and isolates individual failures. Milestone 4 adds a separate queue and optional worker loop; it does not add an inbox watch loop.
 
 ### Event identity and schema
 
@@ -239,3 +239,59 @@ Retry allowance for worker execution remains bounded per invocation. Repeated sc
 Manifest sources must resolve to regular files within the manifest directory; platform drive paths, absolute paths, alternate data streams, and symlink traversal outside the directory are rejected. Only recognized manifest fields are retained in invalid diagnostics. JSON is never evaluated and cannot select dynamic imports or services. Input aliases, SQLite files and sidecars, and run/event lock files remain protected. Event metadata is HTML escaped and arbitrary manifest-derived text is quoted or JSON escaped in the CLI.
 
 The design provides **at-most-one canonical workflow per event fingerprint within a shared local SQLite state store**. Separate stores, independent machines, network filesystems, malicious database modifications, authenticated event production, and distributed exactly-once delivery are outside this guarantee. Connections are owned and explicitly closed in `finally` blocks, including initialization and failure paths. Reports remain disposable per-file atomic replacements derived from SQLite, not the source of ingestion history.
+
+
+## Durable worker queue
+
+```text
+Event -> Idempotency -> Queue -> Lease -> Worker -> Workflow -> Human Approval -> Completion
+
+QUEUED --eligible claim--> LEASED
+LEASED --workflow checkpoint--> WAITING_FOR_APPROVAL
+LEASED --workflow success--> SUCCEEDED
+LEASED --recoverable error, budget remains--> QUEUED (backoff)
+LEASED --run/event busy--> QUEUED (1-second defer; budget refunded)
+LEASED --expired lease, budget remains--> QUEUED (immediately reclaimable)
+LEASED --exhausted budget or terminal identity failure--> DEAD_LETTER
+WAITING_FOR_APPROVAL --reject/revise--> WAITING_FOR_APPROVAL
+WAITING_FOR_APPROVAL --approve--> SUCCEEDED
+WAITING_FOR_APPROVAL --recoverable revision failure--> QUEUED or DEAD_LETTER (budget)
+WAITING_FOR_APPROVAL --human revision limit--> DEAD_LETTER (non-replayable)
+DEAD_LETTER --explicit replay, if replayable--> QUEUED (new budget)
+```
+
+### Storage and the reservation bridge
+
+`queue_jobs` has unique event and reserved run IDs, immutable job/event/run identity, bounded priority and retry settings, lifetime and current-budget attempt counts, UTC availability/lease timestamps, owner/token, failure metadata, replayability, and replay count. An insertion trigger requires the existing event reservation to match the job. No run foreign key is imposed before execution because enqueue deliberately does not insert a workflow or tasks.
+
+`queue_attempts` retains lifetime attempt number, replay generation, worker ID, private lease token, start/heartbeat/finish timestamps, outcome, error, and lease-loss evidence. Identity fields are immutable. `queue_events` records creation, claiming, start, failures, requeue/deferral, expiration, checkpoint, completion, dead-letter, replay, lost lease, and delivery warnings. Heartbeat renewal updates the attempt timestamp instead of appending unbounded audit spam. CLI inspection omits tokens.
+
+`ingestion.receive` shares Milestone 3 parsing, source containment, content identity, alias/conflict handling, and durable receipt without execution. After receipt, enqueue uses `BEGIN IMMEDIATE` to reserve a run and create its one queue job in a single transaction. A crash before that commit leaves a receipt recoverable by another enqueue; after commit the reservation and job are both durable. `ingestion.reserve` is also used by synchronous claims and reads the current reservation under the write transaction, so even a claim that observed the event before enqueue cannot replace the saved ID. Duplicate enqueue preserves the first job's priority and budget.
+
+### Claim, heartbeat, and fencing
+
+A claim takes `BEGIN IMMEDIATE` and captures one UTC expiration cutoff. It first reconciles successful workflow checkpoints for leases expired at that cutoff, recording WAITING_FOR_APPROVAL or SUCCEEDED without a delivery failure or retry. It then handles remaining leases expired at the same cutoff as EXPIRED attempts, requeuing immediately if budget remains or dead-lettering at the limit. Using one cutoff prevents a lease that expires between these phases from being incorrectly charged as a failure despite a committed checkpoint. It then selects one eligible QUEUED job by highest priority, earliest availability, creation time, and ID. Eligibility is refreshed after expiry processing so clock advancement within the transaction does not postpone the recovered job. Claiming writes LEASED, `secrets.token_hex(32)`, owner, expiry, start time, incremented lifetime/budget counts, and the attempt/audit records before committing.
+
+Heartbeat and result settlement acquire a write transaction, require matching job ID and token, status LEASED, and an expiry strictly later than now. Ownership reads and updates remain in that same serialized transaction. Stale or expired tokens cannot renew, complete, fail, requeue, or dead-letter a job. A rejected token can only mark its own attempt's lease-loss evidence once. Renewal cannot move expiry backward. Tokens are internal fencing values; worker names are asserted diagnostic metadata.
+
+A worker starts a non-daemon heartbeat thread and renews every lease_seconds/3, using separately owned SQLite connections closed after each renewal. If renewal fails, the worker records the local loss and refuses result settlement. Already running Python computation is not forcibly killed. The existing event lock and workflow run lock span actual execution/recovery; they prevent a new lease holder from concurrently mutating the same workflow. A competing worker gets RunBusyError and safely defers, keeping an auditable lifetime attempt but refunding that deferral's budget charge. Ctrl+C joins the heartbeat and requeues an owned interrupted delivery. Process death releases the OS locks; the lease remains durable until expiration/reconciliation.
+
+### Workflow authority and recovery
+
+`worker._execute` calls the existing ingestion recovery entry point with explicit busy propagation and delivery retry behavior. It does not reimplement agents, verification, retry, approval, or revision. It checks reserved identity and supported saved workflow configuration before starting. Completed tasks remain saved; an incomplete task may legitimately repeat after a crash. Once a briefing exists, the existing approval-aware resume path uses its saved evidence even if source files moved.
+
+An unexpired LEASED job belongs exclusively to its token holder, even after its workflow commits WAITING_FOR_APPROVAL or SUCCEEDED. Queue inspection, listing, replay, competing claims, and workflow/event synchronization cannot clear that lease. Publication skips leased jobs; observer reconciliation may finish a saved checkpoint only after lease expiration. A recovered successful checkpoint ends the existing attempt as WAITING_FOR_APPROVAL or SUCCEEDED with lease_lost false, without recording a delivery failure, requeue, or additional attempt. This operation derives exclusively from SQLite workflow facts. Incomplete expired work retains the normal EXPIRED/retry/dead-letter behavior, and actual stale ownership remains rejected and audited.
+
+Released queue jobs synchronize during workflow/event publication and inspection. Approval updates queue SUCCEEDED and event COMPLETED; rejection/revision normally leaves the same queue job waiting with the same delivery count. Interrupted human transitions still support explicit existing `resume`. Recoverable revision failures use queue retry/dead-letter policy; human revision-limit failures are permanently non-replayable. Replaying a delivery never resets human revision limits or immutable approval history.
+
+Reports are disposable. After settlement the worker refreshes compact queue metadata under the existing run lock without executing workflow tasks. A report I/O error returns an error but cannot undo a committed approval checkpoint or create another run; a delivery-warning audit entry retains publication failure evidence. Inspection/explicit resume can recover or regenerate artifacts.
+
+### Delivery budgets and operational scope
+
+Failures use 1, 2, 4, 8... second deterministic backoff, capped at 60 seconds. `max_attempts` is 1–10 per delivery budget; `budget_attempts` counts toward that limit and `attempts` counts lifetime claims. Expired attempts consume budget. Expected lock deferrals refund only their budget charge. Exhaustion records DEAD_LETTER, error type/message, timestamp, and audit evidence. Replay is allowed only for replayable dead letters, increments replay_count, resets budget_attempts, and optionally changes max_attempts while retaining all identities/history. Unsupported immutable execution identity and human revision exhaustion refuse replay. CSV business findings are not delivery errors.
+
+Synchronous ingest and enqueue share the same canonical event and reservation in either order. Enqueue after a completed or paused synchronous run simply reflects that workflow without rerunning it. Explicit synchronous ingest/retry/resume remains available even for queued events; queue budgets bound automatic worker deliveries, not authorized manual workflow operations.
+
+Long-running mode polls rather than busy-spinning when empty. `--max-jobs` counts successful claims, including failures/deferrals, and keeps waiting if the queue has fewer eligible jobs. `--once` takes precedence. CLI exit codes and runnable PowerShell demos are documented in README. Demo failure injection is a worker CLI flag only, never a manifest field or executable hook.
+
+All state writes reuse existing SQLite/sidecar/source protection. Manifest values never select code, SQL identifiers, executable commands, or output links. Queue HTML and CLI metadata are escaped. Connections close explicitly on success, failure, initialization error, and heartbeat paths. Schema additions preserve existing Milestone 1–3 tables and behavior. This is durable local multi-process queue coordination using one shared SQLite state store and local OS locks, with a sufficiently consistent local clock. Network filesystems, independent machines, distributed consensus, global exactly-once processing, and an external network queue are not supported.

@@ -103,6 +103,8 @@ def synchronize(connection: sqlite3.Connection, run_id: str | None = None) -> No
                 log(connection, row["id"], {"WAITING_FOR_APPROVAL": "event_waiting_for_approval",
                     "COMPLETED": "event_completed", "FAILED": "event_failed"}.get(status, "event_processing"),
                     run_id=row["workflow_run_id"], status=status, error=error)
+    from .queue_store import synchronize as synchronize_queue
+    synchronize_queue(connection, run_id)
 
 
 def get(connection: sqlite3.Connection, event_id: str) -> dict | None:

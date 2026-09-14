@@ -12,10 +12,10 @@ def main() -> None:
     environment = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     environment.pop("PYTHONPATH", None)
     with tempfile.TemporaryDirectory(prefix="opscheck-installed-") as directory:
-        def command(*args: str) -> str:
+        def command(*args: str, expected: int = 0) -> str:
             completed = subprocess.run([sys.executable, "-m", "opscheck", *args], cwd=directory,
                                        env=environment, capture_output=True, encoding="utf-8", timeout=30)
-            if completed.returncode != 0:
+            if completed.returncode != expected:
                 raise RuntimeError(f"{args}: {completed.stdout}\n{completed.stderr}")
             return completed.stdout
 
@@ -67,6 +67,40 @@ for name in ("orders-messy.csv", "orders-before.csv", "orders-after.csv", "rules
         assert "Status: COMPLETED" in command("event", event["id"])
         assert "Workflows created: 0" in command("scan", "inbox")
         print("PASS: installed event ingest -> duplicate/same run -> approve -> event COMPLETED; rescan creates zero workflows.")
+
+        # A separate store proves enqueue itself runs no workflow or specialist.
+        state = ("--state-dir", "queue-state")
+        queued = json.loads(command("enqueue", "inbox/job.opscheck.json", *state))
+        assert queued["status"] == "QUEUED" and queued["attempts"] == 0
+        assert command("runs", *state).strip() == ""
+        duplicate = json.loads(command("enqueue", "inbox/job.opscheck.json", *state))
+        assert duplicate["id"] == queued["id"] and duplicate["workflow_run_id"] == queued["workflow_run_id"]
+        assert not duplicate["job_created"]
+        failed = json.loads(command("worker", "--once", "--fail-job-once", *state, expected=2))
+        assert failed["status"] == "QUEUED" and failed["budget_attempts"] == 1
+        # The bounded worker polls through the real one-second retry backoff.
+        paused = json.loads(command("worker", "--max-jobs", "1", "--poll-interval", "0.1", *state))
+        assert paused["status"] == "WAITING_FOR_APPROVAL" and paused["attempts"] == 2
+        assert paused["workflow_run_id"] == queued["workflow_run_id"]
+        assert "SUCCEEDED" in command("approve", queued["workflow_run_id"], "--reviewer", "Package QA", *state)
+        final_job = json.loads(command("job", queued["id"], *state))
+        assert final_job["status"] == "SUCCEEDED" and len(final_job["attempt_history"]) == 2
+        assert "Status: COMPLETED" in command("event", queued["ingestion_id"], *state)
+        assert "SUCCEEDED" in command("run", queued["workflow_run_id"], *state)
+        assert "New queue jobs: 0" in command("scan", "inbox", "--enqueue", *state)
+        print("PASS: installed enqueue/no execution -> duplicate/same job -> delivery failure/backoff -> worker -> approval -> queue SUCCEEDED/event COMPLETED.")
+
+        once_state = ("--state-dir", "queue-once-state")
+        once_job = json.loads(command("enqueue", "inbox/job.opscheck.json", *once_state))
+        assert command("runs", *once_state).strip() == ""
+        once_result = json.loads(command("worker", "--once", *once_state))
+        assert once_result["status"] == "WAITING_FOR_APPROVAL"
+        assert once_result["workflow_run_id"] == once_job["workflow_run_id"]
+        assert "SUCCEEDED" in command("approve", once_job["workflow_run_id"], "--reviewer", "Package QA", *once_state)
+        assert json.loads(command("job", once_job["id"], *once_state))["status"] == "SUCCEEDED"
+        assert "Status: COMPLETED" in command("event", once_job["ingestion_id"], *once_state)
+        assert "SUCCEEDED" in command("run", once_job["workflow_run_id"], *once_state)
+        print("PASS: installed enqueue/no execution -> worker --once -> approval -> queue SUCCEEDED/event COMPLETED/workflow SUCCEEDED.")
 
 
 if __name__ == "__main__":

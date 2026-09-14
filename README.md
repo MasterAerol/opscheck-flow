@@ -200,6 +200,71 @@ Failed jobs do not automatically retry on every scan. Retry reuses the reserved 
 
 This guarantees **at-most-one canonical workflow per event fingerprint within a shared local SQLite state store**. It is local durable coordination, not distributed exactly-once processing. Independent state directories have independent identities; network filesystems, cross-machine leases, authenticated event producers, and a background daemon are outside this milestone.
 
+## Durable Worker Queue
+
+`ingest` still executes a manifest immediately. `enqueue` validates the same manifest, persists/reuses its event, reserves its canonical run ID, and saves one queue job **without running specialists**. `scan INBOX --enqueue` queues an inbox without executing it; repeated scans report zero new queue jobs for known events. Queue commands print JSON, including `duplicate` and `job_created` on enqueue, so PowerShell can capture IDs directly.
+
+```powershell
+# Fresh isolated state; existing runs are not deleted.
+$state = ".opscheck/queue-demo-" + [guid]::NewGuid().ToString("N")
+$job = py -3.12 -m opscheck enqueue opscheck/examples/inbox/job-001.opscheck.json --state-dir $state | ConvertFrom-Json
+py -3.12 -m opscheck queue --state-dir $state
+py -3.12 -m opscheck runs --state-dir $state  # Empty: reservation is not an executed run.
+py -3.12 -m opscheck worker --once --worker-id local-worker-1 --state-dir $state
+py -3.12 -m opscheck job $job.id --state-dir $state  # WAITING_FOR_APPROVAL
+py -3.12 -m opscheck approve $job.workflow_run_id --reviewer "Aerol" --state-dir $state
+py -3.12 -m opscheck job $job.id --state-dir $state  # SUCCEEDED
+py -3.12 -m opscheck event $job.ingestion_id --state-dir $state  # COMPLETED
+```
+
+A **lease** grants one worker temporary ownership of a delivery attempt. A serialized SQLite claim assigns a securely random token and UTC expiration. The worker renews its lease every one-third of the lease duration using a background thread with its own explicitly closed SQLite connections. Heartbeats update attempt timestamps without adding an audit row every time. Inspection redacts lease tokens. Worker names are diagnostic metadata, not authentication.
+
+An unexpired lease remains exclusive to its owner even after the workflow commits a checkpoint; inspection, listing, replay, and competing workers cannot revoke it. After a crash, an expired lease with a saved WAITING_FOR_APPROVAL or SUCCEEDED checkpoint is reconciled successfully without a delivery failure or another attempt. Otherwise expiry is recorded and another worker can claim the **same job, event, and reserved run** within the remaining budget. The existing workflow lock prevents simultaneous workflow execution even if a lease is unexpectedly lost while the original process is alive. A worker encountering that lock defers for one second; its lifetime attempt remains recorded, but the deferral does not spend a failure-budget attempt. A stale token cannot heartbeat or settle delivery. A workflow already running when renewal fails may finish under its OS lock; the stale worker then refuses queue settlement. It cannot forcibly cancel already running Python specialists.
+
+The first normal worker execution stops at `WAITING_FOR_APPROVAL` and clears the lease. CSV quality findings are successful delivery, not a reason to retry. Human rejection/revision uses the existing approval lifecycle and the same job; successful rejection/revision consumes no new queue attempt. Approval produces queue `SUCCEEDED`, event `COMPLETED`, and workflow `SUCCEEDED`. A failed revision can use queue recovery while retaining its immutable approval history; an exhausted human revision limit is non-replayable.
+
+Worker modes and bounds:
+
+```powershell
+py -3.12 -m opscheck worker --once --lease-seconds 30
+py -3.12 -m opscheck worker --worker-id local-worker-1 --poll-interval 2
+py -3.12 -m opscheck worker --max-jobs 5 --poll-interval 0.5
+py -3.12 -m opscheck scan opscheck/examples/inbox --enqueue
+```
+
+`--once` attempts one claim, processes it if available, and exits. The long-running mode polls when empty and exits cleanly on Ctrl+C. `--max-jobs` counts claims, including failed/deferred deliveries; when fewer jobs exist it continues polling until the limit or Ctrl+C. `--once` takes precedence if both are supplied. Lease duration is 5–3600 seconds; poll interval is 0.1–60 seconds; worker IDs are nonblank, at most 128 characters, with no control characters. Enqueue supports `--priority -100..100` (highest first, then oldest available) and `--max-attempts 1..10` (default 3). Duplicate enqueue does not reset priority or delivery budgets.
+
+Recoverable execution failures requeue with deterministic backoff of 1, 2, 4, 8… seconds, capped at 60 seconds. Expired leases can be reclaimed immediately, within the remaining budget. Exhausted attempts become inspectable `DEAD_LETTER` records. Replay preserves all identities, successful task outputs, and prior attempts; it increments `replay_count`, resets `budget_attempts` to zero, and optionally changes `max_attempts`. `attempts` and `attempt_number` are lifetime counts, never reset. Terminal revision/identity failures refuse replay. Delivery budgets and the existing per-task retry allowance are separate.
+
+Safe dead-letter/replay demo (failure comes from the worker CLI, never the manifest):
+
+```powershell
+$deadState = ".opscheck/queue-deadletter-" + [guid]::NewGuid().ToString("N")
+$dead = py -3.12 -m opscheck enqueue opscheck/examples/inbox/job-001.opscheck.json --max-attempts 3 --state-dir $deadState | ConvertFrom-Json
+py -3.12 -m opscheck worker --max-jobs 3 --poll-interval 0.1 --fail-job --state-dir $deadState
+# Exit 2 is expected: three demo failures, with 1- and 2-second retry waits.
+py -3.12 -m opscheck deadletters --state-dir $deadState
+py -3.12 -m opscheck job $dead.id --state-dir $deadState
+py -3.12 -m opscheck replay $dead.id --max-attempts 3 --state-dir $deadState
+py -3.12 -m opscheck worker --once --state-dir $deadState
+py -3.12 -m opscheck approve $dead.workflow_run_id --reviewer "Aerol" --state-dir $deadState
+py -3.12 -m opscheck job $dead.id --state-dir $deadState
+```
+
+`--fail-job` fails each claimed delivery before workflow execution. `--fail-job-once` fails only the first attempt of a job's initial delivery budget; it does not fail after replay. Both are explicitly demo options. Neither executes arbitrary code or changes manifest permissions.
+
+Enqueueing a synchronously ingested event reuses its existing run and reflects its saved workflow state. Synchronous ingestion of a queued event may explicitly execute the reserved run immediately, with the same event/run locks; it cannot create another canonical workflow. Reports show a compact, escaped queue-delivery section when next generated. Inspection and claiming recover leased jobs from committed workflow checkpoints only after lease expiration; workflow state remains authoritative even if report publication failed.
+
+| Queue command | Exit 0 | Exit 2 |
+| --- | --- | --- |
+| `enqueue`, `scan --enqueue` | Queued/reused successfully | Invalid manifest or state error; scan continues other entries |
+| `worker --once` | Empty, paused/succeeded, or safely deferred | Processing failure, lost lease, dead-letter, or publication error |
+| `worker` / `--max-jobs` | Normal completion without delivery errors; Ctrl+C | At least one delivery error before reaching the claim limit, or state error |
+| `queue`, `job`, `deadletters` | Inspection succeeded (including dead-letter records) | State error or job not found |
+| `replay` | Replay accepted | Missing job, wrong state, or non-replayable failure |
+
+This is **durable local multi-process queue coordination using one shared SQLite state store**. Use the same `--state-dir` for every related command. UTC leases assume a sufficiently consistent local system clock. Network filesystems, independent machines, distributed consensus, and global exactly-once delivery are outside the guarantee. No network queue server or paid service is required.
+
 ## Optional local model subagents
 
 If you already have a model running on a compatible local server, add its chat-completions endpoint and installed model name:

@@ -164,6 +164,8 @@ def _connect(path: Path) -> sqlite3.Connection:
         initialize(connection)
         from .event_store import initialize as initialize_events
         initialize_events(connection)
+        from .queue_store import initialize as initialize_queue
+        initialize_queue(connection)
     except BaseException:
         # Ownership transfers only after initialization succeeds.
         connection.close()
@@ -376,7 +378,9 @@ def _result(connection: sqlite3.Connection, run_id: str, state_dir: Path) -> dic
         outputs["briefing_agent"] = approvals[-1]["briefing"]
     pending = next((item for item in approvals if item["status"] == "pending"), None)
     from .event_store import run_metadata
+    from .queue_store import run_metadata as queue_metadata
     return {"run_id": run_id, "status": run["status"], "ingestion": run_metadata(connection, run_id),
+            "queue": queue_metadata(connection, run_id),
             "failure_reason": run["failure_reason"], "approvals": approvals,
             "active_approval_id": pending["id"] if pending else None,
             "approval_iteration": approvals[-1]["iteration"] if approvals else 0,
